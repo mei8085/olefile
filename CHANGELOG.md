@@ -3,6 +3,12 @@ Detailed CHANGELOG
 
 olefile.py
 ----------
+* 2026-11-17 v0.47.dev7:
+    - added read-only forensic enumeration: OleFileIO.forensic_scan() returns
+      OleForensicItem records for residual data (free/unreferenced sectors,
+      stream and ministream slack space, free mini-sectors, orphan directory
+      entries), without altering the normal parsing view
+    - added command line option -f to display forensic items
 * 2023-11-30 v0.47.dev6:
     - fixed issue #142: isOleFile has a new data parameter to handle files in memory properly
     - fixed issue #156: write_sect now correctly detects when data is larger than the sector size

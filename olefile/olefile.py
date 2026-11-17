@@ -98,7 +98,10 @@ __all__ = ['isOleFile', 'OleFileIO', 'OleMetadata', 'enable_logging',
            'DEFECT_FATAL', 'DEFAULT_PATH_ENCODING',
            'MAXREGSECT', 'DIFSECT', 'FATSECT', 'ENDOFCHAIN', 'FREESECT',
            'MAXREGSID', 'NOSTREAM', 'UNKNOWN_SIZE', 'WORD_CLSID',
-           'OleFileIONotClosed'
+           'OleFileIONotClosed', 'OleForensicItem',
+           'FORENSIC_FREE_SECTOR', 'FORENSIC_UNREFERENCED_SECTOR',
+           'FORENSIC_STREAM_SLACK', 'FORENSIC_MINISTREAM_SLACK',
+           'FORENSIC_FREE_MINI_SECTOR', 'FORENSIC_ORPHAN_DIR_ENTRY',
 ]
 
 import io
@@ -266,6 +269,21 @@ DEFECT_FATAL =     40    # an error which cannot be ignored, parsing is
 # Minimal size of an empty OLE file, with 512-bytes sectors = 1536 bytes
 # (this is used in isOleFile and OleFileIO.open)
 MINIMAL_OLEFILE_SIZE = 1536
+
+# [PL]: Forensic item types returned by OleFileIO.forensic_scan()
+#: a sector marked FREESECT in the FAT, but still containing data:
+FORENSIC_FREE_SECTOR = 'free_sector'
+#: a sector allocated in the FAT, but not referenced by any valid sector chain:
+FORENSIC_UNREFERENCED_SECTOR = 'unreferenced_sector'
+#: slack space at the end of the last sector of a stream (in the FAT):
+FORENSIC_STREAM_SLACK = 'stream_slack'
+#: slack space at the end of the last mini-sector of a ministream:
+FORENSIC_MINISTREAM_SLACK = 'ministream_slack'
+#: a mini-sector marked FREESECT in the MiniFAT, but still containing data:
+FORENSIC_FREE_MINI_SECTOR = 'free_mini_sector'
+#: a directory entry not reachable from the current storage tree
+#: (orphan or deleted entry):
+FORENSIC_ORPHAN_DIR_ENTRY = 'orphan_dir_entry'
 
 #=== FUNCTIONS ===============================================================
 
@@ -1012,6 +1030,58 @@ class OleDirectoryEntry:
         if self.createTime == 0:
             return None
         return filetime2datetime(self.createTime)
+
+
+#--- OleForensicItem ----------------------------------------------------------
+
+class OleForensicItem:
+    """
+    Read-only forensic record describing residual data found in an OLE file,
+    returned by OleFileIO.forensic_scan().
+
+    Each record keeps enough information to locate the residual data and to
+    understand where it comes from, without altering the normal parsing view
+    of the OLE file.
+
+    Attributes:
+
+        - item_type: str, one of the FORENSIC_* constants
+        - name: original directory entry name, when known (str or None)
+        - path: path of the stream in the storage tree (list of names), when
+          the item belongs to a stream of the current directory tree
+        - sid: index of the related directory entry, or None
+        - sect: index of the first sector of the residual data (FAT sector
+          index, or mini-sector index for MiniFAT-related items)
+        - offset: absolute offset in the file in bytes, when it can be
+          determined (None for items located in the MiniStream when the
+          MiniStream chain is unknown)
+        - size: size of the residual data region in bytes
+        - source: string describing the provenance of the item (which table,
+          chain or directory entry it was located from)
+        - data: residual data bytes (may be None, e.g. for an orphan
+          directory entry whose stream data could not be read)
+        - entry_type: directory entry type for orphan directory entries
+          (STGTY_* constant), None otherwise
+    """
+
+    def __init__(self, item_type, name=None, path=None, sid=None, sect=None,
+                 offset=None, size=0, source=None, data=None, entry_type=None):
+        self.item_type = item_type
+        self.name = name
+        self.path = path
+        self.sid = sid
+        self.sect = sect
+        self.offset = offset
+        self.size = size
+        self.source = source
+        self.data = data
+        self.entry_type = entry_type
+
+    def __repr__(self):
+        return ('OleForensicItem(item_type=%r, name=%r, sid=%r, sect=%r, '
+                'offset=%r, size=%r, source=%r)'
+                % (self.item_type, self.name, self.sid, self.sect,
+                   self.offset, self.size, self.source))
 
 
 #--- OleFileIO ----------------------------------------------------------------
@@ -1839,6 +1909,396 @@ class OleFileIO:
         """
         self.root.dump()
 
+    # --- Forensic enumeration (read-only) -----------------------------------
+    #
+    # The following methods implement a forensic view of the OLE file, fully
+    # isolated from the normal parsing view: they only perform raw read
+    # operations on the file, and never modify the attributes used by the
+    # parser (FAT, MiniFAT, directory entries, parsing issues, ...), so that
+    # running a forensic scan cannot change the results of listdir,
+    # openstream or any other regular method.
+
+    def _forensic_read_sector(self, sect):
+        """
+        Read a sector from the file, read-only helper for forensic_scan.
+        Unlike getsect(), this method never raises defects and never modifies
+        the parser state.
+
+        :param sect: int, sector index
+        :returns: sector data as bytes, or None if it cannot be read
+        """
+        try:
+            self.fp.seek(self.sectorsize * (sect + 1))
+            return self.fp.read(self.sectorsize)
+        except Exception:
+            log.debug('forensic: cannot read sector %Xh', sect)
+            return None
+
+    def _forensic_read_minisector(self, ministream_chain, msect):
+        """
+        Read a mini-sector from the MiniStream, read-only helper for
+        forensic_scan.
+
+        :param ministream_chain: list of FAT sector indexes of the MiniStream
+        :param msect: int, mini-sector index within the MiniStream
+        :returns: mini-sector data as bytes, or None if it cannot be read
+        """
+        if not ministream_chain or msect < 0:
+            return None
+        offset = msect * self.mini_sector_size
+        chain_index = offset // self.sectorsize
+        if chain_index >= len(ministream_chain):
+            return None
+        sector_data = self._forensic_read_sector(ministream_chain[chain_index])
+        if sector_data is None:
+            return None
+        start = offset % self.sectorsize
+        return sector_data[start:start + self.mini_sector_size]
+
+    def _forensic_minisector_offset(self, ministream_chain, msect):
+        """
+        Convert a mini-sector index to an absolute file offset, using the
+        MiniStream sector chain. Returns None if it cannot be determined.
+        """
+        if not ministream_chain or msect < 0:
+            return None
+        offset = msect * self.mini_sector_size
+        chain_index = offset // self.sectorsize
+        if chain_index >= len(ministream_chain):
+            return None
+        return ((ministream_chain[chain_index] + 1) * self.sectorsize
+                + offset % self.sectorsize)
+
+    @staticmethod
+    def _forensic_follow_chain(fat, start):
+        """
+        Follow a sector chain in a FAT or MiniFAT table, safely.
+        Stops at ENDOFCHAIN, FREESECT, any special sector value, any index
+        out of range, or when a loop is detected.
+
+        :param fat: list/array of sector indexes (FAT or MiniFAT)
+        :param start: index of the first sector of the chain
+        :returns: list of sector indexes (may be empty)
+        """
+        chain = []
+        seen = set()
+        sect = start & 0xFFFFFFFF
+        nb_sect = len(fat)
+        while sect <= MAXREGSECT and sect < nb_sect and sect not in seen:
+            seen.add(sect)
+            chain.append(sect)
+            sect = fat[sect] & 0xFFFFFFFF
+        return chain
+
+    @staticmethod
+    def _forensic_path_str(path):
+        """
+        Convert a stream path (list of names) to a printable string, whatever
+        the path encoding of the OleFileIO object.
+        """
+        try:
+            return '/'.join(path)
+        except TypeError:
+            # path elements are bytes when a path_encoding is set:
+            return repr(path)
+
+    def forensic_scan(self):
+        """
+        Read-only forensic enumeration of residual data in the OLE file.
+
+        This method enumerates areas of the file that are not reachable
+        through the normal parsing view but may still contain data:
+
+        - sectors marked FREESECT in the FAT but still containing data
+          (FORENSIC_FREE_SECTOR)
+        - sectors allocated in the FAT but not referenced by any valid sector
+          chain (FORENSIC_UNREFERENCED_SECTOR)
+        - slack space at the end of the last sector of each stream
+          (FORENSIC_STREAM_SLACK)
+        - slack space at the end of the last mini-sector of each ministream
+          (FORENSIC_MINISTREAM_SLACK)
+        - mini-sectors marked FREESECT in the MiniFAT but still containing
+          data (FORENSIC_FREE_MINI_SECTOR)
+        - directory entries not reachable from the current storage tree,
+          i.e. orphan or deleted entries (FORENSIC_ORPHAN_DIR_ENTRY)
+
+        Metadata regions (header, FAT, DIFAT, MiniFAT and directory sectors)
+        are never reported as residual stream content, and sectors shared by
+        several chains are excluded from slack space analysis to avoid false
+        positives.
+
+        This method is strictly read-only: it does not modify any attribute
+        used by the normal parsing view, so listdir, openstream and all other
+        methods return the same results whether forensic_scan was called or
+        not.
+
+        :returns: list of OleForensicItem objects
+        """
+        items = []
+        if self.fp is None or self.fat is None or self.root is None:
+            raise OleFileError('forensic_scan: the OLE file is not open')
+        sectorsize = self.sectorsize
+        fat = [(v & 0xFFFFFFFF) for v in self.fat]
+        nb_sect = len(fat)
+
+        # === 1. Locate metadata regions (FAT, DIFAT, directory and MiniFAT
+        # sectors): they must never be reported as residual stream content.
+        metadata_sectors = set()
+        fat_sectors = set()
+        # the DIFAT of the first 109 FAT sectors is stored in the header:
+        try:
+            self.fp.seek(0)
+            header = self.fp.read(512)
+        except Exception:
+            header = None
+        if header is not None and len(header) == 512:
+            for i in range(109):
+                v = i32(header, 76 + 4 * i)
+                if v <= MAXREGSECT and v < nb_sect:
+                    fat_sectors.add(v)
+        # follow the DIFAT chain to find the remaining FAT sectors:
+        sect = self.first_difat_sector
+        if sect is not None and sect != ENDOFCHAIN and sect != FREESECT:
+            for _ in range(self.num_difat_sectors or 0):
+                if sect > MAXREGSECT or sect >= nb_sect:
+                    break
+                metadata_sectors.add(sect)  # the DIFAT sector itself
+                data = self._forensic_read_sector(sect)
+                if data is None or len(data) != sectorsize:
+                    break
+                entries = self.sect2array(data)
+                for v in entries[:-1]:
+                    v = v & 0xFFFFFFFF
+                    if v <= MAXREGSECT and v < nb_sect:
+                        fat_sectors.add(v)
+                sect = entries[-1] & 0xFFFFFFFF
+        metadata_sectors.update(fat_sectors)
+        # directory sectors:
+        dir_chain = self._forensic_follow_chain(fat, self.first_dir_sector)
+        metadata_sectors.update(dir_chain)
+        # MiniFAT sectors:
+        minifat_chain = []
+        if self.num_mini_fat_sectors:
+            minifat_chain = self._forensic_follow_chain(
+                fat, self.first_mini_fat_sector)
+            metadata_sectors.update(minifat_chain)
+
+        # === 2. Load the MiniFAT and locate the MiniStream locally, without
+        # touching the minifat/ministream attributes of the parsing view.
+        minifat = None
+        ministream_chain = []
+        if minifat_chain and self.root.size:
+            data = b''.join(self._forensic_read_sector(s) or b''
+                            for s in minifat_chain)
+            try:
+                minifat = [(v & 0xFFFFFFFF) for v in self.sect2array(data)]
+            except Exception:
+                minifat = None
+            if minifat is not None:
+                # only mini-sectors within the MiniStream are relevant:
+                nb_minisectors = ((self.root.size + self.mini_sector_size - 1)
+                                  // self.mini_sector_size)
+                minifat = minifat[:nb_minisectors]
+            ministream_chain = self._forensic_follow_chain(
+                fat, self.root.isectStart)
+
+        # === 3. Walk the directory tree (normal parsing view) to collect
+        # the sector chains of all valid streams. Sectors referenced by
+        # several chains are counted, to avoid reporting shared sectors as
+        # slack space.
+        used_sectors = set(ministream_chain)
+        used_minisectors = set()
+        sector_ref_count = {}
+        minisector_ref_count = {}
+        tree_sids = set([self.root.sid])
+        fat_streams = []   # (entry, path, chain) for streams in the FAT
+        mini_streams = []  # (entry, path, chain) for streams in the MiniFAT
+        todo = [(self.root, [])]
+        while todo:
+            node, prefix = todo.pop()
+            for kid in node.kids:
+                path = prefix + [kid.name]
+                tree_sids.add(kid.sid)
+                if kid.entry_type == STGTY_STORAGE:
+                    todo.append((kid, path))
+                elif kid.entry_type == STGTY_STREAM:
+                    if kid.size == 0:
+                        continue
+                    if kid.is_minifat:
+                        if minifat is not None:
+                            chain = self._forensic_follow_chain(
+                                minifat, kid.isectStart)
+                            mini_streams.append((kid, path, chain))
+                            for s in chain:
+                                used_minisectors.add(s)
+                                minisector_ref_count[s] = \
+                                    minisector_ref_count.get(s, 0) + 1
+                    else:
+                        chain = self._forensic_follow_chain(
+                            fat, kid.isectStart)
+                        fat_streams.append((kid, path, chain))
+                        for s in chain:
+                            used_sectors.add(s)
+                            sector_ref_count[s] = sector_ref_count.get(s, 0) + 1
+        for s in ministream_chain:
+            sector_ref_count[s] = sector_ref_count.get(s, 0) + 1
+
+        # === 4. Orphan directory entries: present in the directory stream
+        # but not reachable from the current storage tree. The raw entries
+        # are parsed locally (without creating OleDirectoryEntry objects, so
+        # that the parsing view is not modified).
+        orphan_sectors = set()
+        dir_data = b''.join(self._forensic_read_sector(s) or b''
+                            for s in dir_chain)
+        nb_entries = len(dir_data) // OleDirectoryEntry.DIRENTRY_SIZE
+        for sid in range(nb_entries):
+            if sid in tree_sids:
+                continue
+            raw = dir_data[sid * 128:(sid + 1) * 128]
+            if len(raw) < OleDirectoryEntry.DIRENTRY_SIZE:
+                break
+            try:
+                (name_raw, namelength, entry_type, color,
+                 sid_left, sid_right, sid_child, clsid, flags,
+                 ctime, mtime, isect_start, size_low, size_high
+                 ) = struct.unpack(OleDirectoryEntry.STRUCT_DIRENTRY, raw)
+            except Exception:
+                continue
+            if entry_type == STGTY_EMPTY:
+                continue
+            # decode the original name, read-only:
+            name = None
+            if 2 <= namelength <= 64:
+                try:
+                    name = self._decode_utf16_str(name_raw[:namelength - 2])
+                except Exception:
+                    name = None
+            if sectorsize == 512:
+                size = size_low
+            else:
+                size = size_low + (size_high << 32)
+            # for an orphan stream, try to recover its data and remember its
+            # sectors so they are not reported again as unreferenced:
+            data = None
+            if entry_type == STGTY_STREAM and size > 0:
+                if size >= self.minisectorcutoff:
+                    chain = self._forensic_follow_chain(fat, isect_start)
+                    orphan_sectors.update(chain)
+                    data = b''.join(self._forensic_read_sector(s) or b''
+                                    for s in chain)[:size]
+                elif minifat is not None:
+                    chain = self._forensic_follow_chain(minifat, isect_start)
+                    data = b''.join(
+                        self._forensic_read_minisector(ministream_chain, s)
+                        or b'' for s in chain)[:size]
+            items.append(OleForensicItem(
+                FORENSIC_ORPHAN_DIR_ENTRY, name=name, sid=sid,
+                sect=isect_start if isect_start <= MAXREGSECT else None,
+                size=size,
+                source='directory entry SID=%d, not referenced by the '
+                       'storage tree' % sid,
+                data=data, entry_type=entry_type))
+
+        # === 5. Sectors marked FREESECT in the FAT but still containing data
+        for i in range(nb_sect):
+            if fat[i] != FREESECT or i in metadata_sectors:
+                continue
+            data = self._forensic_read_sector(i)
+            if data and any(data):
+                items.append(OleForensicItem(
+                    FORENSIC_FREE_SECTOR, sect=i,
+                    offset=(i + 1) * sectorsize, size=len(data),
+                    source='FAT (sector marked FREESECT)', data=data))
+
+        # === 6. Sectors allocated in the FAT but not referenced by any valid
+        # chain (nor by an orphan directory entry)
+        for i in range(nb_sect):
+            v = fat[i]
+            if v == FREESECT or v == FATSECT or v == DIFSECT:
+                # free sectors are handled above; FATSECT/DIFSECT values
+                # denote metadata regions, never residual stream content
+                continue
+            if (i in metadata_sectors or i in used_sectors
+                    or i in orphan_sectors):
+                continue
+            data = self._forensic_read_sector(i)
+            if data and any(data):
+                items.append(OleForensicItem(
+                    FORENSIC_UNREFERENCED_SECTOR, sect=i,
+                    offset=(i + 1) * sectorsize, size=len(data),
+                    source='FAT (allocated sector, not referenced by any '
+                           'valid chain)', data=data))
+
+        # === 7. Slack space at the end of the last sector of FAT streams
+        for entry, path, chain in fat_streams:
+            if not chain:
+                continue
+            tail = chain[-1]
+            if sector_ref_count.get(tail, 0) > 1:
+                # sector shared by several chains: skip, to avoid reporting
+                # cross-chain data as slack space
+                continue
+            rem = entry.size % sectorsize
+            if rem == 0:
+                continue
+            data = self._forensic_read_sector(tail)
+            if data is None:
+                continue
+            slack = data[rem:]
+            if slack and any(slack):
+                items.append(OleForensicItem(
+                    FORENSIC_STREAM_SLACK, name=entry.name, path=path,
+                    sid=entry.sid, sect=tail,
+                    offset=(tail + 1) * sectorsize + rem, size=len(slack),
+                    source='slack space at end of stream "%s"'
+                           % self._forensic_path_str(path),
+                    data=slack))
+
+        # === 8. Slack space at the end of the last mini-sector of
+        # ministreams
+        for entry, path, chain in mini_streams:
+            if not chain:
+                continue
+            tail = chain[-1]
+            if minisector_ref_count.get(tail, 0) > 1:
+                # mini-sector shared by several chains: skip
+                continue
+            rem = entry.size % self.mini_sector_size
+            if rem == 0:
+                continue
+            data = self._forensic_read_minisector(ministream_chain, tail)
+            if data is None:
+                continue
+            slack = data[rem:]
+            if slack and any(slack):
+                items.append(OleForensicItem(
+                    FORENSIC_MINISTREAM_SLACK, name=entry.name, path=path,
+                    sid=entry.sid, sect=tail,
+                    offset=self._forensic_minisector_offset(
+                        ministream_chain, tail),
+                    size=len(slack),
+                    source='slack space at end of ministream "%s"'
+                           % self._forensic_path_str(path),
+                    data=slack))
+
+        # === 9. Mini-sectors marked FREESECT in the MiniFAT but still
+        # containing data
+        if minifat is not None:
+            for m in range(len(minifat)):
+                if minifat[m] != FREESECT or m in used_minisectors:
+                    continue
+                data = self._forensic_read_minisector(ministream_chain, m)
+                if data and any(data):
+                    items.append(OleForensicItem(
+                        FORENSIC_FREE_MINI_SECTOR, sect=m,
+                        offset=self._forensic_minisector_offset(
+                            ministream_chain, m),
+                        size=len(data),
+                        source='MiniFAT (mini-sector marked FREESECT)',
+                        data=data))
+
+        return items
+
     def _open(self, start, size = UNKNOWN_SIZE, force_FAT=False):
         """
         Open a stream, either in FAT or MiniFAT according to its size.
@@ -2566,6 +3026,9 @@ def main():
 
     parser.add_option("-c", action="store_true", dest="check_streams",
         help='check all streams (for debugging purposes)')
+    parser.add_option("-f", action="store_true", dest="forensic",
+        help='forensic mode: enumerate residual data (free sectors, slack '
+             'space, orphan directory entries)')
     parser.add_option("-p", action="store_true", dest="extract_customprop",
                       help='extract all user-defined propertires')
     parser.add_option("-d", action="store_true", dest="debug_mode",
@@ -2646,6 +3109,17 @@ def main():
                         ole.openstream(streamname)
                     else:
                         print('NOT a stream : type=%d' % st_type)
+                print()
+
+            if options.forensic:
+                # Enumerate residual data (read-only forensic view):
+                print('\nForensic items (residual data):')
+                forensic_items = ole.forensic_scan()
+                if forensic_items:
+                    for item in forensic_items:
+                        print('-', item)
+                else:
+                    print('None')
                 print()
 
             # for streamname in ole.listdir():

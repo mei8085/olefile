@@ -276,5 +276,215 @@ class FileHandleCloseTest(unittest.TestCase):
     #     self.assertTrue(file_handle.closed)
 
 
+class TestForensicScan(unittest.TestCase):
+    """Tests for the read-only forensic enumeration (OleFileIO.forensic_scan)"""
+
+    # Layout of the synthetic OLE file (512-byte sectors):
+    #   sector 0:     FAT
+    #   sector 1:     directory
+    #   sector 2:     MiniFAT
+    #   sector 3:     MiniStream (root entry stream, 2 mini-sectors)
+    #   sectors 4-12: stream "A" (4196 bytes, slack at end of sector 12)
+    #   sector 13:    FREESECT, but contains data
+    #   sector 14:    allocated (ENDOFCHAIN) but not referenced by any chain
+    #   sectors 15-22: stream of orphan directory entry "ghost" (4096 bytes)
+    # MiniStream: mini-sector 0 = stream "B" (20 bytes + slack),
+    #             mini-sector 1 = FREESECT, but contains data
+    NB_SECT = 23
+    A_DATA = b'A' * 4196
+    A_SLACK = b'\xCC' * 412
+    B_DATA = b'B' * 20
+    B_SLACK = b'\xAA' * 44
+    FREE_MINI_DATA = b'\xBB' * 64
+    FREE_SECT_DATA = b'\xDD' * 512
+    UNREF_SECT_DATA = b'\xEE' * 512
+    GHOST_DATA = b'G' * 4096
+
+    @classmethod
+    def build_ole_file(cls):
+        """Build a synthetic OLE file in memory, with residual data."""
+        import struct
+        ENDOFCHAIN = 0xFFFFFFFE
+        FREESECT = 0xFFFFFFFF
+        FATSECT = 0xFFFFFFFD
+        NOSTREAM = 0xFFFFFFFF
+
+        # --- FAT (sector 0) ---
+        fat = [FREESECT] * 128
+        fat[0] = FATSECT
+        fat[1] = ENDOFCHAIN                    # directory
+        fat[2] = ENDOFCHAIN                    # MiniFAT
+        fat[3] = ENDOFCHAIN                    # MiniStream
+        for i in range(4, 12):                 # stream A chain
+            fat[i] = i + 1
+        fat[12] = ENDOFCHAIN
+        fat[13] = FREESECT                     # free sector with data
+        fat[14] = ENDOFCHAIN                   # allocated, unreferenced
+        for i in range(15, 22):                # orphan stream chain
+            fat[i] = i + 1
+        fat[22] = ENDOFCHAIN
+        sect_fat = struct.pack('<128L', *fat)
+
+        # --- directory (sector 1) ---
+        def dirent(name, etype, left, right, child, isect, size):
+            name_raw = (name.encode('utf-16-le') + b'\x00\x00').ljust(64, b'\x00')
+            return struct.pack('<64sHBBIII16sIQQIII', name_raw,
+                               len(name) * 2 + 2, etype, 1,
+                               left, right, child, b'\x00' * 16, 0, 0, 0,
+                               isect, size, 0)
+        sect_dir = b''.join([
+            dirent('Root Entry', 5, NOSTREAM, NOSTREAM, 1, 3, 128),
+            dirent('A', 2, NOSTREAM, 2, NOSTREAM, 4, len(cls.A_DATA)),
+            dirent('B', 2, NOSTREAM, NOSTREAM, NOSTREAM, 0, len(cls.B_DATA)),
+            dirent('ghost', 2, NOSTREAM, NOSTREAM, NOSTREAM, 15,
+                   len(cls.GHOST_DATA)),
+        ])
+
+        # --- MiniFAT (sector 2): mini 0 used by B, mini 1 free ---
+        minifat = [ENDOFCHAIN, FREESECT] + [FREESECT] * 126
+        sect_minifat = struct.pack('<128L', *minifat)
+
+        # --- MiniStream (sector 3) ---
+        sect_ministream = (cls.B_DATA + cls.B_SLACK + cls.FREE_MINI_DATA
+                           + b'\x00' * 384)
+
+        # --- header ---
+        header = struct.pack(
+            '<8s16sHHHHHHLLLLLLLLLL',
+            olefile.MAGIC, b'\x00' * 16, 0x003E, 3, 0xFFFE, 9, 6, 0, 0,
+            0, 1, 1, 0, 0x1000, 2, 1, ENDOFCHAIN, 0)
+        header += struct.pack('<109L', 0, *([FREESECT] * 108))
+
+        sectors = [sect_fat, sect_dir, sect_minifat, sect_ministream]
+        sectors += [b'A' * 512] * 8                       # sectors 4-11
+        sectors.append(b'A' * 100 + cls.A_SLACK)          # sector 12
+        sectors.append(cls.FREE_SECT_DATA)                # sector 13
+        sectors.append(cls.UNREF_SECT_DATA)               # sector 14
+        sectors += [b'G' * 512] * 8                       # sectors 15-22
+        assert len(sectors) == cls.NB_SECT
+        return header + b''.join(sectors)
+
+    def setUp(self):
+        self.ole_data = self.build_ole_file()
+
+    def tearDown(self):
+        if hasattr(self, 'ole') and self.ole is not None:
+            self.ole.close()
+
+    def open_ole(self):
+        self.ole = olefile.OleFileIO(io.BytesIO(self.ole_data))
+        return self.ole
+
+    def test_normal_parsing_view(self):
+        """The synthetic file must parse as a normal OLE file"""
+        ole = self.open_ole()
+        self.assertEqual(ole.parsing_issues, [])
+        self.assertEqual(sorted(ole.listdir()), [['A'], ['B']])
+        self.assertEqual(ole.openstream('A').read(), self.A_DATA)
+        self.assertEqual(ole.openstream('B').read(), self.B_DATA)
+
+    def test_forensic_scan_finds_residual_data(self):
+        """forensic_scan must find all kinds of residual data"""
+        ole = self.open_ole()
+        items = ole.forensic_scan()
+        by_type = {}
+        for item in items:
+            by_type.setdefault(item.item_type, []).append(item)
+
+        # slack space at end of stream A (last FAT sector):
+        slack = by_type[olefile.FORENSIC_STREAM_SLACK]
+        self.assertEqual(len(slack), 1)
+        self.assertEqual(slack[0].name, 'A')
+        self.assertEqual(slack[0].path, ['A'])
+        self.assertEqual(slack[0].sect, 12)
+        self.assertEqual(slack[0].offset, 13 * 512 + 100)
+        self.assertEqual(slack[0].size, 412)
+        self.assertEqual(slack[0].data, self.A_SLACK)
+
+        # slack space at end of ministream B (last mini-sector):
+        mslack = by_type[olefile.FORENSIC_MINISTREAM_SLACK]
+        self.assertEqual(len(mslack), 1)
+        self.assertEqual(mslack[0].name, 'B')
+        self.assertEqual(mslack[0].sect, 0)
+        self.assertEqual(mslack[0].data, self.B_SLACK)
+
+        # free mini-sector with data:
+        freemini = by_type[olefile.FORENSIC_FREE_MINI_SECTOR]
+        self.assertEqual(len(freemini), 1)
+        self.assertEqual(freemini[0].sect, 1)
+        self.assertEqual(freemini[0].data, self.FREE_MINI_DATA)
+
+        # free sector with data:
+        freesect = by_type[olefile.FORENSIC_FREE_SECTOR]
+        self.assertEqual(len(freesect), 1)
+        self.assertEqual(freesect[0].sect, 13)
+        self.assertEqual(freesect[0].offset, 14 * 512)
+        self.assertEqual(freesect[0].data, self.FREE_SECT_DATA)
+
+        # allocated but unreferenced sector:
+        unref = by_type[olefile.FORENSIC_UNREFERENCED_SECTOR]
+        self.assertEqual(len(unref), 1)
+        self.assertEqual(unref[0].sect, 14)
+        self.assertEqual(unref[0].data, self.UNREF_SECT_DATA)
+
+        # orphan directory entry, with original name and start sector:
+        orphan = by_type[olefile.FORENSIC_ORPHAN_DIR_ENTRY]
+        self.assertEqual(len(orphan), 1)
+        self.assertEqual(orphan[0].name, 'ghost')
+        self.assertEqual(orphan[0].sid, 3)
+        self.assertEqual(orphan[0].sect, 15)
+        self.assertEqual(orphan[0].size, len(self.GHOST_DATA))
+        self.assertEqual(orphan[0].data, self.GHOST_DATA)
+        self.assertEqual(orphan[0].entry_type, olefile.STGTY_STREAM)
+
+        # exactly 6 items, nothing else:
+        self.assertEqual(len(items), 6)
+
+    def test_forensic_scan_does_not_report_metadata(self):
+        """FAT, MiniFAT, directory and MiniStream sectors must not be
+        reported as residual stream content"""
+        ole = self.open_ole()
+        items = ole.forensic_scan()
+        for item in items:
+            if item.item_type in (olefile.FORENSIC_FREE_SECTOR,
+                                  olefile.FORENSIC_UNREFERENCED_SECTOR):
+                # sectors 0 (FAT), 1 (directory), 2 (MiniFAT) and
+                # 3 (MiniStream) are metadata, never residual content:
+                self.assertNotIn(item.sect, (0, 1, 2, 3))
+
+    def test_forensic_scan_does_not_alter_parsing_view(self):
+        """forensic_scan must be isolated from the normal parsing view"""
+        ole = self.open_ole()
+        # baseline of the normal parsing view:
+        listdir_before = ole.listdir()
+        stream_a_before = ole.openstream('A').read()
+        stream_b_before = ole.openstream('B').read()
+        issues_before = list(ole.parsing_issues)
+        # run the forensic scan:
+        items = ole.forensic_scan()
+        self.assertTrue(len(items) > 0)
+        # the normal parsing view must be strictly unchanged:
+        self.assertEqual(ole.listdir(), listdir_before)
+        self.assertEqual(ole.openstream('A').read(), stream_a_before)
+        self.assertEqual(ole.openstream('B').read(), stream_b_before)
+        self.assertEqual(ole.parsing_issues, issues_before)
+        # a second scan must return the same results:
+        items2 = ole.forensic_scan()
+        self.assertEqual(
+            [(i.item_type, i.name, i.sid, i.sect, i.size) for i in items2],
+            [(i.item_type, i.name, i.sid, i.sect, i.size) for i in items])
+
+    def test_forensic_scan_on_real_file(self):
+        """forensic_scan must run without error on a real OLE file"""
+        ole = olefile.OleFileIO(u"tests/images/test-ole-file.doc")
+        items = ole.forensic_scan()
+        self.assertIsInstance(items, list)
+        for item in items:
+            self.assertIsInstance(item, olefile.OleForensicItem)
+        # the normal parsing view still works after the scan:
+        self.assertTrue(len(ole.listdir()) > 0)
+        ole.close()
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -7,6 +7,8 @@ import unittest
 
 import os, sys
 import io
+import struct
+import time
 from shutil import copy2
 
 # Insert the olefile package relative to this test dir in the sys.path
@@ -274,6 +276,199 @@ class FileHandleCloseTest(unittest.TestCase):
     #
     #     # now should be closed
     #     self.assertTrue(file_handle.closed)
+
+
+class TestSectorChainDefects(unittest.TestCase):
+    """
+    Tests for sector-chain hardening against FAT/MiniFAT loops (cycles) and
+    cross-references between incompatible stream chains.
+    All malformed documents are built in memory by mutating a valid OLE file.
+    """
+
+    def setUp(self):
+        self.ole_file = u"tests/images/test-ole-file.doc"
+        with open(self.ole_file, 'rb') as f:
+            self.valid_data = f.read()
+        # capture the legitimate stream contents and root chain, to prove that
+        # a malformed chain neither reorders nor changes valid parsing:
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            self.legit_streams = {
+                tuple(path): ole.openstream(path).read()
+                for path in ole.listdir()}
+            ole.root.build_sect_chain(ole)
+            self.legit_root_chain = list(ole.root.sect_chain)
+            self.sector_size = ole.sector_size
+
+    def _fat_entry_offset(self, fat_index):
+        """Byte offset of a FAT entry in the OLE file (works with DIFAT too)."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            entries_per_sector = ole.sector_size // 4
+            fat_sect = ole.fat.index(olefile.FATSECT)
+            fat_sect += fat_index // entries_per_sector
+            index_in_sector = fat_index % entries_per_sector
+        return (fat_sect + 1) * self.sector_size + index_in_sector * 4
+
+    def _minifat_entry_offset(self, mini_index):
+        """Byte offset of a MiniFAT entry inside the MiniFAT stream on disk."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            minifat_start = ole.first_mini_fat_sector
+            sector_size = ole.sector_size
+            entries_per_sector = sector_size // 4
+        fat_sect = minifat_start + mini_index // entries_per_sector
+        index_in_sector = mini_index % entries_per_sector
+        return (fat_sect + 1) * sector_size + index_in_sector * 4
+
+    def _mutated(self, offsets_and_values):
+        data = bytearray(self.valid_data)
+        for offset, value in offsets_and_values:
+            struct.pack_into('<I', data, offset, value)
+        return io.BytesIO(bytes(data))
+
+    def test_fat_loop_raises_defect(self):
+        """A FAT chain loop must raise a defect instead of returning repeated data."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            entry = ole.direntries[ole._find('WordDocument')]
+            start = entry.isectStart
+        # make the second sector point back at the first: start <-> start+1
+        bio = self._mutated([(self._fat_entry_offset(start + 1), start)])
+        with olefile.OleFileIO(bio, raise_defects=olefile.DEFECT_INCORRECT) as ole:
+            with self.assertRaises(olefile.olefile.OleFileError) as ctx:
+                ole.openstream('WordDocument')
+            self.assertIn('loop', str(ctx.exception))
+
+    def test_fat_loop_is_bounded_and_recorded_at_default_level(self):
+        """At the default defect level the loop is recorded and traversal stops."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            entry = ole.direntries[ole._find('WordDocument')]
+            start, size = entry.isectStart, entry.size
+        bio = self._mutated([(self._fat_entry_offset(start + 1), start)])
+        t0 = time.time()
+        with olefile.OleFileIO(bio) as ole:   # default: DEFECT_FATAL
+            stream = ole.openstream('WordDocument')
+            data = stream.read()
+        self.assertLess(time.time() - t0, 2.0)
+        self.assertTrue(any('loop' in msg for _, msg in ole.parsing_issues))
+        # the chain was stopped before the loop, the stream is shorter than
+        # declared but never contains repeated sectors:
+        self.assertEqual(len(data), 2 * self.sector_size)
+        self.assertLess(len(data), size)
+
+    def test_fat_self_loop_does_not_hang_unknown_size_stream(self):
+        """A self-referencing directory sector must not loop forever."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            dir_start = ole.first_dir_sector
+        bio = self._mutated([(self._fat_entry_offset(dir_start), dir_start)])
+        t0 = time.time()
+        try:
+            olefile.OleFileIO(bio)
+        except olefile.olefile.OleFileError:
+            pass   # raising the defect is also acceptable
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_minifat_loop_raises_defect(self):
+        """A loop in the MiniFAT chain must be detected like a FAT loop."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            entry = ole.direntries[ole._find('\x01CompObj')]
+            mini_start = entry.isectStart
+        # point the first mini sector at itself:
+        bio = self._mutated([(self._minifat_entry_offset(mini_start), mini_start)])
+        with olefile.OleFileIO(bio, raise_defects=olefile.DEFECT_INCORRECT) as ole:
+            with self.assertRaises(olefile.olefile.OleFileError) as ctx:
+                ole.openstream('\x01CompObj')
+            self.assertIn('loop', str(ctx.exception))
+
+    def test_minifat_loop_bounded_and_recorded(self):
+        bio = self._mutated([(self._minifat_entry_offset(0), 0)])
+        t0 = time.time()
+        with olefile.OleFileIO(bio) as ole:
+            data = ole.openstream('\x01CompObj').read()
+        self.assertLess(time.time() - t0, 2.0)
+        self.assertTrue(any('loop' in msg for _, msg in ole.parsing_issues))
+        self.assertLessEqual(len(data), 64)   # one mini sector at most
+
+    def test_cross_referenced_fat_sector_raises_conflict(self):
+        """Two streams sharing a FAT sector must produce an explicit conflict."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            word = ole.direntries[ole._find('WordDocument')]
+            table = ole.direntries[ole._find('1Table')]
+        # repoint 1Table's first sector into the WordDocument chain:
+        bio = self._mutated([
+            (self._fat_entry_offset(table.isectStart), word.isectStart)])
+        with olefile.OleFileIO(bio, raise_defects=olefile.DEFECT_INCORRECT) as ole:
+            ole.openstream('WordDocument')          # claims the sectors first
+            with self.assertRaises(olefile.olefile.OleFileError) as ctx:
+                ole.openstream('1Table')            # re-enters a used sector
+            self.assertIn('referenced by several stream chains',
+                          str(ctx.exception))
+
+    def test_cross_reference_does_not_affect_other_streams(self):
+        """A conflicting chain is recorded but other objects parse unchanged."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            word = ole.direntries[ole._find('WordDocument')]
+            table = ole.direntries[ole._find('1Table')]
+        bio = self._mutated([
+            (self._fat_entry_offset(table.isectStart), word.isectStart)])
+        with olefile.OleFileIO(bio) as ole:
+            self.assertEqual(ole.openstream('WordDocument').read(),
+                             self.legit_streams[('WordDocument',)])
+            try:
+                ole.openstream('1Table')
+            except olefile.olefile.OleFileError:
+                pass
+            # unrelated streams are parsed exactly as in the valid file:
+            self.assertEqual(
+                ole.openstream('\x05SummaryInformation').read(),
+                self.legit_streams[('\x05SummaryInformation',)])
+            self.assertEqual(
+                ole.openstream('\x05DocumentSummaryInformation').read(),
+                self.legit_streams[('\x05DocumentSummaryInformation',)])
+            self.assertTrue(any('referenced by several stream chains' in msg
+                                for _, msg in ole.parsing_issues))
+
+    def test_out_of_range_fat_pointer_raises(self):
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            word = ole.direntries[ole._find('WordDocument')]
+            start = word.isectStart
+        bio = self._mutated([
+            (self._fat_entry_offset(start + 1), 0x0ABCDEF0)])
+        with olefile.OleFileIO(bio, raise_defects=olefile.DEFECT_INCORRECT) as ole:
+            with self.assertRaises(olefile.olefile.OleFileError) as ctx:
+                ole.openstream('WordDocument')
+            self.assertIn('out of range', str(ctx.exception))
+
+    def test_build_sect_chain_loop_is_bounded(self):
+        """build_sect_chain (write path) must terminate on a cyclic chain."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            table = ole.direntries[ole._find('1Table')]
+            start = table.isectStart
+        bio = self._mutated([(self._fat_entry_offset(start + 1), start)])
+        t0 = time.time()
+        with olefile.OleFileIO(bio, write_mode=True) as ole:
+            entry = ole.direntries[ole._find('1Table')]
+            entry.build_sect_chain(ole)
+        self.assertLess(time.time() - t0, 2.0)
+        # only the chain prefix before the loop is returned:
+        self.assertEqual(entry.sect_chain, [start, start + 1])
+
+    def test_build_sect_chain_out_of_range_stops(self):
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            table = ole.direntries[ole._find('1Table')]
+            start = table.isectStart
+        bio = self._mutated([
+            (self._fat_entry_offset(start + 1), 0x0ABCDEF0)])
+        with olefile.OleFileIO(bio, write_mode=True) as ole:
+            entry = ole.direntries[ole._find('1Table')]
+            entry.build_sect_chain(ole)
+        self.assertEqual(entry.sect_chain, [start, start + 1])
+
+    def test_legitimate_chains_unchanged(self):
+        """Valid chains keep their exact order and content, with no issues."""
+        with olefile.OleFileIO(io.BytesIO(self.valid_data)) as ole:
+            for path, expected in self.legit_streams.items():
+                self.assertEqual(ole.openstream(list(path)).read(), expected)
+            ole.root.build_sect_chain(ole)
+            self.assertEqual(ole.root.sect_chain, self.legit_root_chain)
+            self.assertEqual(ole.parsing_issues, [])
 
 
 if __name__ == '__main__':

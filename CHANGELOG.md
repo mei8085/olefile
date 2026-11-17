@@ -3,6 +3,17 @@ Detailed CHANGELOG
 
 olefile.py
 ----------
+* 2026-11-17 (unreleased):
+    - hardening of FAT/MiniFAT sector chain parsing:
+        - OleStream now detects loops in a sector chain and stops extending the
+          chain immediately, so a cyclic FAT/MiniFAT cannot cause unbounded
+          traversal, out-of-range reads or silently repeated stream data
+        - build_sect_chain (write path) is now bounded and cycle-safe, and
+          rejects out-of-range sector indexes instead of looping forever
+        - added per-sector cross-reference detection: a FAT/MiniFAT sector
+          reached from two incompatible stream chains now raises/records a
+          clear defect instead of returning ambiguous data; other streams and
+          valid chains are unaffected
 * 2023-11-30 v0.47.dev6:
     - fixed issue #142: isOleFile has a new data parameter to handle files in memory properly
     - fixed issue #156: write_sect now correctly detects when data is larger than the sector size

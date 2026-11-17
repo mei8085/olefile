@@ -599,7 +599,8 @@ class OleStream(io.BytesIO):
     # the fat chain, and load new sectors on demand instead of
     # loading it all in one go.
 
-    def __init__(self, fp, sect, size, offset, sectorsize, fat, filesize, olefileio):
+    def __init__(self, fp, sect, size, offset, sectorsize, fat, filesize, olefileio,
+                 minifat=False):
         """
         Constructor for OleStream class.
 
@@ -611,6 +612,8 @@ class OleStream(io.BytesIO):
         :param fat: array/list of sector indexes (FAT or MiniFAT)
         :param filesize: size of OLE file (for debugging)
         :param olefileio: OleFileIO object containing this stream
+        :param minifat: bool, True if this stream follows a MiniFAT chain,
+            False for a standard FAT chain
         :returns: a BytesIO instance containing the OLE stream
         """
         log.debug('OleStream.__init__:')
@@ -643,6 +646,12 @@ class OleStream(io.BytesIO):
         # at the end to concatenate all in one string.
         # (this may not be really useful with recent Python versions)
         data = []
+        # [PL] Sectors already visited while following this chain.
+        # A malformed FAT/MiniFAT may contain a loop (a sector pointing back to
+        # a sector already seen in the same chain). The for loop below is
+        # bounded anyway, but without this check the same sectors would be read
+        # several times and the stream would silently contain repeated data.
+        visited_sects = set()
         # if size is zero, then first sector index should be ENDOFCHAIN:
         if size == 0 and sect != ENDOFCHAIN:
             log.debug('size == 0 and sect != ENDOFCHAIN:')
@@ -672,6 +681,23 @@ class OleStream(io.BytesIO):
                 self.ole._raise_defect(DEFECT_INCORRECT, 'incorrect OLE FAT, sector index out of range')
                 # stop reading here if the exception is ignored:
                 break
+            # [PL] cycle detection: the same sector must never appear twice in
+            # one sector chain. Stop extending the chain as soon as the conflict
+            # is found, so a loop can never cause an unbounded traversal or an
+            # out-of-range read:
+            if sect in visited_sects:
+                log.debug('OleStream: sector chain loop detected at sector %d (%X)'
+                    % (sect, sect))
+                self.ole._raise_defect(DEFECT_INCORRECT,
+                    'incorrect OLE FAT, loop detected in sector chain')
+                # stop reading here if the exception is ignored:
+                break
+            visited_sects.add(sect)
+            # [PL] cross-reference detection: according to [MS-CFB], a regular
+            # sector belongs to at most one stream. If the same FAT/MiniFAT
+            # sector is reached from another stream's chain, report the conflict
+            # explicitly instead of returning ambiguous data:
+            self.ole._register_chain_sector(sect, minifat)
             # TODO: merge this code with OleFileIO.getsect() ?
             # TODO: check if this works with 4K sectors:
             try:
@@ -872,13 +898,33 @@ class OleDirectoryEntry:
         if self.is_minifat and not ole_file.minifat:
             ole_file.loadminifat()
 
+        if self.is_minifat:
+            fat = ole_file.minifat
+        else:
+            fat = ole_file.fat
+        # Sectors already visited in this chain, used to detect FAT/MiniFAT
+        # loops: a malformed chain must never be followed around a loop, which
+        # would otherwise cause an unbounded traversal.
+        visited_sects = set()
         next_sect = self.isectStart
-        while next_sect != ENDOFCHAIN:
+        # The walk is also bounded by the number of entries in the FAT, so it
+        # always terminates even if the cycle detection below is bypassed.
+        while next_sect != ENDOFCHAIN and len(self.sect_chain) <= len(fat):
+            next_sect = next_sect & 0xFFFFFFFF  # JYTHON-WORKAROUND
+            # every index used to index the FAT must point to a regular sector:
+            if next_sect < 0 or next_sect >= len(fat):
+                ole_file._raise_defect(DEFECT_INCORRECT,
+                    'incorrect OLE FAT, sector index out of range in sector chain')
+                # stop extending the chain if the exception is ignored:
+                break
+            if next_sect in visited_sects:
+                ole_file._raise_defect(DEFECT_INCORRECT,
+                    'incorrect OLE FAT, loop detected in sector chain')
+                # stop extending the chain if the exception is ignored:
+                break
+            visited_sects.add(next_sect)
             self.sect_chain.append(next_sect)
-            if self.is_minifat:
-                next_sect = ole_file.minifat[next_sect]
-            else:
-                next_sect = ole_file.fat[next_sect]
+            next_sect = fat[next_sect]
 
     def build_storage_tree(self):
         """
@@ -1085,6 +1131,10 @@ class OleFileIO:
         self.ministream = None
         self._used_streams_fat = []
         self._used_streams_minifat = []
+        # sets of FAT/MiniFAT sector indexes already used by a stream chain,
+        # to detect cross-references (sectors shared by incompatible chains):
+        self._used_sects_fat = set()
+        self._used_sects_minifat = set()
         self.byte_order = None
         self.directory_fp = None
         self.direntries = None
@@ -1248,6 +1298,10 @@ class OleFileIO:
         # (list of indexes of first sectors of each stream)
         self._used_streams_fat = []
         self._used_streams_minifat = []
+        # sets of FAT/MiniFAT sector indexes already used by a stream chain,
+        # to detect cross-references (sectors shared by incompatible chains):
+        self._used_sects_fat = set()
+        self._used_sects_minifat = set()
 
         header = self.fp.read(512)
 
@@ -1457,6 +1511,35 @@ class OleFileIO:
             self._raise_defect(DEFECT_INCORRECT, 'Stream referenced twice')
         else:
             used_streams.append(first_sect)
+
+    def _register_chain_sector(self, sect, minifat=False):
+        """
+        Register a sector used by a stream chain, and detect cross-references.
+
+        Unlike _check_duplicate_stream, which only checks the first sector of
+        each stream, this method is called for every sector followed by
+        OleStream. According to [MS-CFB], a regular FAT/MiniFAT sector belongs
+        to at most one stream chain, so reaching a sector already used by
+        another chain is a structural conflict. The result is deterministic:
+        a defect is raised (or recorded if defects are ignored) and the sector
+        is marked as used in any case, so the conflict is reported only once
+        and does not affect other streams.
+
+        :param sect: int, index of the sector in the FAT or MiniFAT
+        :param minifat: bool, if True, sector is in the MiniFAT, else in the FAT
+        """
+        if minifat:
+            used_sects = self._used_sects_minifat
+            table_name = 'MiniFAT'
+        else:
+            used_sects = self._used_sects_fat
+            table_name = 'FAT'
+        if sect in used_sects:
+            self._raise_defect(DEFECT_INCORRECT,
+                'OLE %s sector %d referenced by several stream chains'
+                % (table_name, sect))
+        else:
+            used_sects.add(sect)
 
     def dumpfat(self, fat, firstindex=0):
         """
@@ -1867,14 +1950,14 @@ class OleFileIO:
             return OleStream(fp=self.ministream, sect=start, size=size,
                              offset=0, sectorsize=self.minisectorsize,
                              fat=self.minifat, filesize=self.ministream.size,
-                             olefileio=self)
+                             olefileio=self, minifat=True)
         else:
             # standard stream
             return OleStream(fp=self.fp, sect=start, size=size,
                              offset=self.sectorsize,
                              sectorsize=self.sectorsize, fat=self.fat,
                              filesize=self._filesize,
-                             olefileio=self)
+                             olefileio=self, minifat=False)
 
     def _list(self, files, prefix, node, streams=True, storages=False):
         """

@@ -1337,6 +1337,16 @@ class OleFileIO:
             self._raise_defect(DEFECT_INCORRECT, "incorrect ByteOrder in OLE header")
             # TODO: add big-endian support for documents created on Mac ?
             # But according to [MS-CFB] ? v20140502, ByteOrder MUST be 0xFFFE.
+        # [PL] check sector_shift BEFORE computing 2**sector_shift: on a
+        # malformed file, a large shift would otherwise create a huge integer,
+        # whose string conversion in the debug log below may raise ValueError
+        # (Python 3.11+ limits int<->str conversions) instead of a controlled
+        # defect, and wastes CPU/memory (DoS):
+        if self.sector_shift not in (9, 12):
+            self._raise_defect(DEFECT_INCORRECT, "incorrect sector_shift in OLE header")
+            # if the defect was not raised as an exception, fall back to the
+            # standard value matching the DLL version, to keep parsing bounded:
+            self.sector_shift = 9 if self.dll_version == 3 else 12
         self.sector_size = 2**self.sector_shift
         log.debug( "Sector Size   = %d bytes (expected: 512 or 4096)" % self.sector_size )
         if self.sector_size not in [512, 4096]:
@@ -1344,6 +1354,12 @@ class OleFileIO:
         if (self.dll_version==3 and self.sector_size!=512) \
         or (self.dll_version==4 and self.sector_size!=4096):
             self._raise_defect(DEFECT_INCORRECT, "sector_size does not match DllVersion in OLE header")
+        # [PL] same check as above for mini_sector_shift, before 2**shift:
+        if self.mini_sector_shift != 6:
+            self._raise_defect(DEFECT_INCORRECT, "incorrect mini_sector_shift in OLE header")
+            # if the defect was not raised as an exception, fall back to the
+            # only standard value, to keep parsing bounded:
+            self.mini_sector_shift = 6
         self.mini_sector_size = 2**self.mini_sector_shift
         log.debug( "MiniFAT Sector Size   = %d bytes (expected: 64)" % self.mini_sector_size )
         if self.mini_sector_size not in [64]:

@@ -98,6 +98,7 @@ __all__ = ['isOleFile', 'OleFileIO', 'OleMetadata', 'enable_logging',
            'DEFECT_FATAL', 'DEFAULT_PATH_ENCODING',
            'MAXREGSECT', 'DIFSECT', 'FATSECT', 'ENDOFCHAIN', 'FREESECT',
            'MAXREGSID', 'NOSTREAM', 'UNKNOWN_SIZE', 'WORD_CLSID',
+           'OleFileError', 'NotOleFileError',
            'OleFileIONotClosed'
 ]
 
@@ -859,6 +860,8 @@ class OleDirectoryEntry:
 
         :param OleFileIO ole_file: OleFileIO object containing this directory entry
         :return: nothing
+        :raises OleFileError: if the chain is malformed (loop, truncated or
+            referencing an index outside the allocation table)
         """
         # TODO: seems to be used only from _write_mini_stream, is it useful?
         # TODO: use self.olefile instead of ole_file
@@ -867,18 +870,17 @@ class OleDirectoryEntry:
         if self.entry_type not in (STGTY_ROOT, STGTY_STREAM) or self.size == 0:
             return
 
-        self.sect_chain = list()
-
         if self.is_minifat and not ole_file.minifat:
             ole_file.loadminifat()
 
-        next_sect = self.isectStart
-        while next_sect != ENDOFCHAIN:
-            self.sect_chain.append(next_sect)
-            if self.is_minifat:
-                next_sect = ole_file.minifat[next_sect]
-            else:
-                next_sect = ole_file.fat[next_sect]
+        if self.is_minifat:
+            fat = ole_file.minifat
+        else:
+            fat = ole_file.fat
+        # Delegated to a bounded, cycle-detecting implementation so that a
+        # malicious FAT/MiniFAT can no longer cause an infinite loop here:
+        self.sect_chain = ole_file._build_sect_chain(
+            self.isectStart, fat, minifat=self.is_minifat)
 
     def build_storage_tree(self):
         """
@@ -1716,6 +1718,86 @@ class OleFileIO:
             self._raise_defect(DEFECT_FATAL, 'incomplete OLE sector')
         return sector
 
+    def _build_sect_chain(self, first_sect, fat, minifat=False):
+        """
+        Safely follow a FAT (or MiniFAT) sector chain and return the list of
+        sector indexes.
+
+        Unlike an unbounded ``while`` loop, this method is guaranteed to
+        terminate: every step consumes a new sector index and a chain cannot
+        legitimately contain more entries than the allocation table itself.
+        Malformed chains (cycles, indexes out of the table, reserved/non-data
+        sector values) are rejected with an OleFileError before any write is
+        attempted, so they can never cause an infinite loop or a write outside
+        the file.
+
+        :param int first_sect: index of the first sector of the chain
+        :param fat: array/list of sector indexes (FAT or MiniFAT)
+        :param bool minifat: True if ``fat`` is the MiniFAT
+        :return: list of sector indexes making up the chain (never empty)
+        :rtype: list
+        :raises OleFileError: if the chain is truncated, loops, references an
+            index outside the table or uses a reserved sector value
+        """
+        table_name = 'MiniFAT' if minifat else 'FAT'
+        chain = []
+        seen = set()
+        next_sect = first_sect & 0xFFFFFFFF
+        # A valid chain holds at most one entry per table slot, which gives a
+        # strict, finite upper bound on the number of data sectors it can
+        # contain. The loop is allowed one extra iteration to observe the
+        # ENDOFCHAIN marker of a chain filling the whole table.
+        while len(chain) <= len(fat):
+            if next_sect == ENDOFCHAIN:
+                if not chain:
+                    break
+                return chain
+            # every other reserved value (FREESECT, FATSECT, DIFSECT, ...) is
+            # not a valid data sector in a stream chain:
+            if next_sect >= MAXREGSECT:
+                raise OleFileError(
+                    'invalid OLE %s chain: reserved sector index 0x%08X'
+                    % (table_name, next_sect))
+            if next_sect >= len(fat):
+                raise OleFileError(
+                    'incorrect OLE %s, sector index out of range' % table_name)
+            if next_sect in seen:
+                raise OleFileError(
+                    'loop detected in OLE %s sector chain' % table_name)
+            seen.add(next_sect)
+            chain.append(next_sect)
+            next_sect = fat[next_sect] & 0xFFFFFFFF
+        # the chain contains more data sectors than the table has slots, i.e.
+        # it is truncated or loops without a reserved end-of-chain marker:
+        raise OleFileError(
+            'invalid OLE %s chain: end-of-chain marker not reached' % table_name)
+
+    def _validate_sect_chain(self, first_sect, fat, expected_sectors,
+                             minifat=False):
+        """
+        Validate a sector chain used by a write operation and return it.
+
+        The chain must be well formed (see :meth:`_build_sect_chain`) and must
+        contain exactly ``expected_sectors`` sectors, matching the size of the
+        stream being written. Validation happens entirely before any write, so
+        a rejected chain never modifies the file or leaves it half written.
+
+        :param int first_sect: index of the first sector of the chain
+        :param fat: array/list of sector indexes (FAT or MiniFAT)
+        :param int expected_sectors: required number of sectors
+        :param bool minifat: True if ``fat`` is the MiniFAT
+        :return: validated list of sector indexes
+        :rtype: list
+        :raises OleFileError: if the chain is malformed or has the wrong length
+        """
+        chain = self._build_sect_chain(first_sect, fat, minifat=minifat)
+        if len(chain) != expected_sectors:
+            table_name = 'MiniFAT' if minifat else 'FAT'
+            raise OleFileError(
+                'incorrect OLE %s chain: expected %d sectors, found %d'
+                % (table_name, expected_sectors, len(chain)))
+        return chain
+
     def write_sect(self, sect, data, padding=b'\x00'):
         """
         Write given sector to file on disk.
@@ -1729,6 +1811,12 @@ class OleFileIO:
         if not isinstance(padding, bytes) or len(padding)!=1:
             raise TypeError("write_sect: padding must be a bytes string of 1 char")
         # TODO: we could allow padding=None for no padding at all
+        # [PL] reject indexes outside the file before seeking, to prevent a
+        # malicious FAT from extending the file or writing past its end:
+        if not isinstance(sect, int) or sect < 0 or sect >= self.nb_sect:
+            log.debug('write_sect(): sect=%X, nb_sect=%d, filesize=%d' %
+                (sect, self.nb_sect, self._filesize))
+            raise OleFileError('OLE sector index out of range')
         try:
             self.fp.seek(self.sectorsize * (sect+1))
         except Exception:
@@ -1755,6 +1843,13 @@ class OleFileIO:
         if not isinstance(padding, bytes) or len(padding) != 1:
             raise TypeError("write_mini_sect: padding must be a bytes string of 1 char")
 
+        # [PL] never write past the end of the file, even with a corrupted
+        # MiniFAT or corrupted root entry sector chain:
+        if (not isinstance(fp_pos, int) or fp_pos < 0
+                or fp_pos + self.mini_sector_size > self._filesize):
+            log.debug('write_mini_sect(): fp_pos=%d, filesize=%d' %
+                      (fp_pos, self._filesize))
+            raise OleFileError('OLE mini sector index out of range')
         try:
             self.fp.seek(fp_pos)
         except Exception:
@@ -1970,21 +2065,48 @@ class OleFileIO:
         return self._open(entry.isectStart, entry.size)
 
     def _write_mini_stream(self, entry, data_to_write):
-        if not entry.sect_chain:
-            entry.build_sect_chain(self)
-        nb_sectors = len(entry.sect_chain)
+        # The stream chain (MiniFAT) and the root ministream chain (FAT) are
+        # both fully validated before any write, so a malicious chain is
+        # rejected without touching the file and cannot loop or write outside
+        # the file.
+        if not self.minifat:
+            self.loadminifat()
+        expected_sectors = (entry.size + self.mini_sector_size - 1) \
+            // self.mini_sector_size
+        entry_chain = self._validate_sect_chain(
+            entry.isectStart, self.minifat, expected_sectors, minifat=True)
+        entry.sect_chain = entry_chain
 
-        if not self.root.sect_chain:
-            self.root.build_sect_chain(self)
+        root_expected = (self.root.size + self.sector_size - 1) \
+            // self.sector_size
+        root_chain = self._validate_sect_chain(
+            self.root.isectStart, self.fat, root_expected, minifat=False)
+        self.root.sect_chain = root_chain
+
+        nb_sectors = len(entry_chain)
         block_size = self.sector_size // self.mini_sector_size
-        for idx, sect in enumerate(entry.sect_chain):
+        # Resolve and check every target file position up front: a mini sector
+        # must map inside one of the sectors of the root ministream.
+        write_plan = []
+        for idx, sect in enumerate(entry_chain):
             sect_base = sect // block_size
             sect_offset = sect % block_size
-            fp_pos = (self.root.sect_chain[sect_base] + 1)*self.sector_size + sect_offset*self.mini_sector_size
+            if sect_base >= len(root_chain):
+                raise OleFileError(
+                    'incorrect OLE MiniFAT, mini sector index out of range')
+            fp_pos = (root_chain[sect_base] + 1) * self.sector_size \
+                + sect_offset * self.mini_sector_size
             if idx < (nb_sectors - 1):
-                data_per_sector = data_to_write[idx * self.mini_sector_size: (idx + 1) * self.mini_sector_size]
+                data_per_sector = data_to_write[
+                    idx * self.mini_sector_size:
+                    (idx + 1) * self.mini_sector_size]
             else:
-                data_per_sector = data_to_write[idx * self.mini_sector_size:]
+                data_per_sector = data_to_write[
+                    idx * self.mini_sector_size:]
+            write_plan.append((fp_pos, data_per_sector))
+        # Only now, once the whole chain is known to be safe, perform the
+        # actual writes:
+        for fp_pos, data_per_sector in write_plan:
             self._write_mini_sect(fp_pos, data_per_sector)
 
     def write_stream(self, stream_name, data):
@@ -2014,19 +2136,19 @@ class OleFileIO:
         if size < self.minisectorcutoff and entry.entry_type != STGTY_ROOT:
             return self._write_mini_stream(entry = entry, data_to_write = data)
 
-        sect = entry.isectStart
         # number of sectors to write
         nb_sectors = (size + (self.sectorsize-1)) // self.sectorsize
         log.debug('nb_sectors = %d' % nb_sectors)
-        for i in range(nb_sectors):
-            # try:
-            #     self.fp.seek(offset + self.sectorsize * sect)
-            # except Exception:
-            #     log.debug('sect=%d, seek=%d' %
-            #         (sect, offset+self.sectorsize*sect))
-            #     raise IOError('OLE sector index out of range')
+        # Validate the whole FAT chain before writing anything. A malformed
+        # chain (cycle, sector index out of range, reserved value, wrong
+        # length) is rejected here so the file is never partially overwritten
+        # and no unbounded loop is possible.
+        sect_chain = self._validate_sect_chain(
+            entry.isectStart, self.fat, nb_sectors)
+        entry.sect_chain = sect_chain
+        for i, sect in enumerate(sect_chain):
             # extract one sector from data, the last one being smaller:
-            if i<(nb_sectors-1):
+            if i < (nb_sectors-1):
                 data_sector = data [i*self.sectorsize : (i+1)*self.sectorsize]
                 # TODO: comment this if it works
                 assert(len(data_sector)==self.sectorsize)
@@ -2037,16 +2159,6 @@ class OleFileIO:
                     % (size, self.sectorsize, len(data_sector), size % self.sectorsize))
                 assert(len(data_sector) % self.sectorsize==size % self.sectorsize)
             self.write_sect(sect, data_sector)
-            # self.fp.write(data_sector)
-            # jump to next sector in the FAT:
-            try:
-                sect = self.fat[sect]
-            except IndexError:
-                # [PL] if pointer is out of the FAT an exception is raised
-                raise IOError('incorrect OLE FAT, sector index out of range')
-        # [PL] Last sector should be a "end of chain" marker:
-        if sect != ENDOFCHAIN:
-            raise IOError('incorrect last sector index in OLE stream')
 
     def get_type(self, filename):
         """

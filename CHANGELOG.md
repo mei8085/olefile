@@ -3,6 +3,23 @@ Detailed CHANGELOG
 
 olefile.py
 ----------
+* 2026-11-19 (unreleased):
+    - property set parsing: bound every declared count/length against the bytes
+      actually left in the section before allocating or looping, for
+      VT_VECTOR/VT_VECTOR|VT_VARIANT element counts, CodePageString/UnicodeString/
+      BLOB/ClipboardData lengths and the property name dictionary. Malicious
+      counts (for example a 4-byte count of 0xFFFFFFFF) are now rejected with
+      the new distinguishable PropertySetError (an OleFileError and a
+      ValueError) instead of causing memory/CPU amplification.
+    - a malformed property set section size no longer underflows the read (a
+      negative read() argument used to mean "read the whole stream").
+    - a failed property no longer affects the following properties in the same
+      property set; it is left out of the result while parsing continues.
+    - established a consistent relation between the property type, the vector
+      element count, the element width and the remaining bytes, and made all
+      length computations safe for 32-bit count inputs.
+    - fixed the VT_LPWSTR length field offset and validated it before slicing.
+    - exported OleFileError and NotOleFileError from the package (__all__).
 * 2023-11-30 v0.47.dev6:
     - fixed issue #142: isOleFile has a new data parameter to handle files in memory properly
     - fixed issue #156: write_sect now correctly detects when data is larger than the sector size

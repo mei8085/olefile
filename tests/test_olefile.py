@@ -7,6 +7,7 @@ import unittest
 
 import os, sys
 import io
+import struct
 from shutil import copy2
 
 # Insert the olefile package relative to this test dir in the sys.path
@@ -207,6 +208,181 @@ class TestOleFileIO(unittest.TestCase):
             # it should raise ValueError:
             with self.assertRaises(ValueError):
                 ole.write_sect(ole.nb_sect - 1, b"x" * size)
+
+
+class TestPropertySetBounds(unittest.TestCase):
+    """Count/length amplification bounds in property set parsing.
+
+    A declared count must never be trusted on its own: the parser has to relate
+    the property type, the vector element count, the element width and the
+    bytes actually left before allocating or traversing anything.
+    """
+
+    def setUp(self):
+        self.ole = olefile.OleFileIO()
+
+    def parse_value(self, data, property_type):
+        # offset 0 points just past the 4-byte type tag, as in getproperties()
+        return self.ole._parse_property(data, 0, 2, property_type, False, [])
+
+    # --- malicious counts are rejected before use ---------------------------
+
+    def test_huge_vector_of_unsupported_type_rejected(self):
+        with self.assertRaises(olefile.PropertySetError):
+            self.parse_value(struct.pack('<I', 0xffffffff),
+                             olefile.olefile.VT_VECTOR | olefile.olefile.VT_EMPTY)
+
+    def test_huge_vector_of_fixed_width_type_rejected(self):
+        for base in (olefile.olefile.VT_I4, olefile.olefile.VT_UI1,
+                     olefile.olefile.VT_FILETIME):
+            with self.assertRaises(olefile.PropertySetError):
+                self.parse_value(struct.pack('<I', 0xffffffff),
+                                 olefile.olefile.VT_VECTOR | base)
+
+    def test_huge_variant_vector_rejected(self):
+        with self.assertRaises(olefile.PropertySetError):
+            self.parse_value(struct.pack('<I', 0xffffffff),
+                             olefile.olefile.VT_VECTOR | olefile.olefile.VT_VARIANT)
+
+    def test_huge_string_counts_rejected(self):
+        for vt in (olefile.olefile.VT_LPSTR, olefile.olefile.VT_BSTR,
+                   olefile.olefile.VT_BLOB, olefile.olefile.VT_CF):
+            with self.assertRaises(olefile.PropertySetError):
+                self.parse_value(struct.pack('<I', 0xffffffff) + b'x' * 8, vt)
+
+    def test_huge_unicode_count_rejected(self):
+        with self.assertRaises(olefile.PropertySetError):
+            self.parse_value(struct.pack('<I', 0xffffffff) + b'ab',
+                             olefile.olefile.VT_LPWSTR)
+
+    def test_count_larger_than_remaining_bytes_rejected(self):
+        # two VT_I4 elements need 8 bytes, but only 4 are present
+        with self.assertRaises(olefile.PropertySetError):
+            self.parse_value(struct.pack('<Ii', 2, 42),
+                             olefile.olefile.VT_VECTOR | olefile.olefile.VT_I4)
+
+    def test_truncated_string_payload_rejected(self):
+        # length says 100 bytes, only 3 are present
+        with self.assertRaises(olefile.PropertySetError):
+            self.parse_value(struct.pack('<I', 100) + b'abc',
+                             olefile.olefile.VT_LPSTR)
+
+    def test_error_is_value_error_and_olefile_error(self):
+        # the distinguishable error must remain catchable both ways
+        self.assertTrue(issubclass(olefile.PropertySetError, ValueError))
+        self.assertTrue(issubclass(olefile.PropertySetError, IOError))
+        self.assertTrue(issubclass(olefile.PropertySetError, olefile.olefile.OleFileError))
+
+    # --- legitimate values are unchanged ------------------------------------
+
+    def test_valid_scalars_unchanged(self):
+        VT = olefile.olefile
+        self.assertEqual(self.parse_value(struct.pack('<h', -3), VT.VT_I2), -3)
+        self.assertEqual(self.parse_value(struct.pack('<H', 0xffff), VT.VT_UI2), 65535)
+        # VT_I4 is decoded as an unsigned 32-bit value by the original parser;
+        # that encoding is preserved for compatibility (only VT_I2 is signed).
+        self.assertEqual(self.parse_value(struct.pack('<i', -7), VT.VT_I4), 0xfffffff9)
+        self.assertEqual(self.parse_value(struct.pack('<I', 4), VT.VT_UI4), 4)
+        self.assertEqual(self.parse_value(struct.pack('<H', 0xffff), VT.VT_BOOL), True)
+        self.assertEqual(self.parse_value(b'\x05', VT.VT_UI1), 5)
+        self.assertEqual(self.parse_value(struct.pack('<I', 4) + b'abc\x00', VT.VT_LPSTR), b'abc')
+        self.assertEqual(self.parse_value(struct.pack('<I', 3) + b'xyz', VT.VT_BLOB), b'xyz')
+
+    def test_valid_unicode_string_unchanged(self):
+        data = struct.pack('<I', 3) + u'Hi\x00'.encode('utf-16le')
+        self.assertEqual(self.parse_value(data, olefile.olefile.VT_LPWSTR), u'Hi\x00')
+
+    def test_unicode_string_length_read_from_value_header(self):
+        # The Length field is the first 4 bytes of the value; the characters
+        # follow. A following property must not leak into the decoded string.
+        lpwstr = struct.pack('<I', 3) + u'Hi\x00'.encode('utf-16le')
+        trailing = struct.pack('<I', 30) + b'SECRET\x00'   # next property bytes
+        data = lpwstr + trailing
+        value, size = self.ole._parse_property_basic(
+            data, 0, 2, olefile.olefile.VT_LPWSTR, False, [])
+        self.assertEqual(value, u'Hi\x00')
+        self.assertEqual(size, len(lpwstr))
+
+    def test_valid_vectors_unchanged(self):
+        VT = olefile.olefile
+        self.assertEqual(
+            self.parse_value(struct.pack('<III', 2, 17, 23), VT.VT_VECTOR | VT.VT_UI4),
+            [17, 23])
+        self.assertEqual(self.parse_value(struct.pack('<I', 0), VT.VT_VECTOR | VT.VT_EMPTY), [])
+        # a variant vector keeps its per-element type tags
+        data = struct.pack('<I', 2) + struct.pack('<Ii', VT.VT_I4, 42) \
+            + struct.pack('<IH', VT.VT_I2, 1)
+        self.assertEqual(self.parse_value(data, VT.VT_VECTOR | VT.VT_VARIANT), [42, 1])
+
+    def test_empty_properties_unchanged(self):
+        VT = olefile.olefile
+        self.assertIsNone(self.parse_value(b'', VT.VT_EMPTY))
+        self.assertIsNone(self.parse_value(b'', VT.VT_NULL))
+
+    # --- isolation: a failing property cannot poison the others ------------
+
+    def build_stream(self, properties):
+        """Build a minimal PropertySetStream from (pid, vt, payload) tuples."""
+        count = len(properties)
+        header_size = 8 + 8 * count
+        body = b''
+        offsets = []
+        for pid, vt, payload in properties:
+            offsets.append(header_size + len(body))
+            body += struct.pack('<I', vt) + payload
+        section = struct.pack('<II', header_size + len(body), count)
+        for (pid, vt, payload), offset in zip(properties, offsets):
+            section += struct.pack('<II', pid, offset)
+        section += body
+        stream = struct.pack('<HHI', 0xFFFE, 0, 0) + b'\x00' * 16 \
+            + struct.pack('<I', 1)
+        stream += b'\x00' * 16 + struct.pack('<I', 48) + section
+        return stream
+
+    def getproperties(self, properties, raise_defects=olefile.DEFECT_FATAL):
+        data = self.build_stream(properties)
+        ole = olefile.OleFileIO(raise_defects=raise_defects)
+        ole.openstream = lambda name: io.BytesIO(data)
+        return ole, ole.getproperties('props')
+
+    def test_failed_property_does_not_affect_following_ones(self):
+        VT = olefile.olefile
+        properties = [
+            # a malicious count that must be rejected
+            (1, VT.VT_VECTOR | VT.VT_I4, struct.pack('<I', 0xffffffff)),
+            # then perfectly valid values
+            (2, VT.VT_LPSTR, struct.pack('<I', 3) + b'ok\x00'),
+            (3, VT.VT_I4, struct.pack('<i', 7)),
+        ]
+        ole, props = self.getproperties(properties)
+        self.assertEqual(props, {2: b'ok', 3: 7})
+        self.assertTrue(ole.parsing_issues)
+
+    def test_failed_property_is_not_published(self):
+        VT = olefile.olefile
+        ole, props = self.getproperties([
+            (1, VT.VT_VECTOR | VT.VT_VARIANT, struct.pack('<I', 0xffffffff)),
+        ])
+        self.assertNotIn(1, props)
+
+    def test_strict_mode_raises_distinguishable_error(self):
+        VT = olefile.olefile
+        with self.assertRaises(olefile.PropertySetError):
+            self.getproperties(
+                [(1, VT.VT_VECTOR | VT.VT_I4, struct.pack('<I', 0xffffffff))],
+                raise_defects=olefile.DEFECT_INCORRECT)
+
+    def test_section_size_underflow_is_rejected(self):
+        # a section size below the 8-byte header used to make read() receive a
+        # negative count (i.e. "read everything"); it must be rejected instead
+        for size in (0, 1, 4, 7):
+            data = struct.pack('<HHI', 0xFFFE, 0, 0) + b'\x00' * 16 \
+                + struct.pack('<I', 1) + b'\x00' * 16 \
+                + struct.pack('<I', 48) + struct.pack('<I', size) + b'\x00' * 32
+            ole = olefile.OleFileIO()
+            ole.openstream = lambda name, data=data: io.BytesIO(data)
+            self.assertEqual(ole.getproperties('props'), {})
+            self.assertTrue(ole.parsing_issues)
 
 
 class FileHandleCloseTest(unittest.TestCase):

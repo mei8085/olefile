@@ -98,7 +98,8 @@ __all__ = ['isOleFile', 'OleFileIO', 'OleMetadata', 'enable_logging',
            'DEFECT_FATAL', 'DEFAULT_PATH_ENCODING',
            'MAXREGSECT', 'DIFSECT', 'FATSECT', 'ENDOFCHAIN', 'FREESECT',
            'MAXREGSID', 'NOSTREAM', 'UNKNOWN_SIZE', 'WORD_CLSID',
-           'OleFileIONotClosed'
+           'OleFileIONotClosed', 'PropertySetError',
+           'OleFileError', 'NotOleFileError'
 ]
 
 import io
@@ -247,6 +248,49 @@ VT = {}
 for keyword, var in list(vars().items()):
     if keyword[:3] == "VT_":
         VT[var] = keyword
+
+# Fixed width in bytes of the value payload of the property types that have a
+# width defined by [MS-OLEPS]. It includes types whose value this parser does
+# not decode yet: their width is still needed to bound a VT_VECTOR of that type
+# and to keep the element offset in sync.
+# Types whose width is declared inside the value itself (CodePageString,
+# UnicodeString, BLOB, ClipboardData) are handled separately, see
+# VT_MIN_VALUE_SIZE. This table is used to establish a consistent bound between
+# a declared vector element count, the element width and the number of bytes
+# actually left in the property set: a count can never require more bytes than
+# remain.
+VT_FIXED_VALUE_SIZE = {
+    VT_I2: 2,
+    VT_UI2: 2,
+    VT_BOOL: 2,
+    VT_I4: 4,
+    VT_INT: 4,
+    VT_ERROR: 4,
+    VT_UI4: 4,
+    VT_UINT: 4,
+    VT_R4: 4,
+    VT_R8: 8,
+    VT_CY: 8,
+    VT_DATE: 8,
+    VT_DECIMAL: 16,
+    VT_I1: 1,
+    VT_I8: 8,
+    VT_UI8: 8,
+    VT_FILETIME: 8,
+    VT_UI1: 1,
+    VT_CLSID: 16,
+}
+
+# Minimum width in bytes of one vector element, per length-prefixed type. It is
+# the width of the length/count field alone; the payload declared by that field
+# is checked separately when it is parsed.
+VT_MIN_VALUE_SIZE = {
+    VT_BSTR: 4,
+    VT_LPSTR: 4,
+    VT_LPWSTR: 4,
+    VT_BLOB: 4,
+    VT_CF: 4,
+}
 
 #
 # --------------------------------------------------------------------
@@ -400,6 +444,25 @@ class OleFileError(IOError):
 class NotOleFileError(OleFileError):
     """
     Error raised when the opened file is not an OLE file.
+    """
+    pass
+
+
+class PropertySetError(OleFileError, ValueError):
+    """
+    Error raised when a property set (stream such as ``\\x05SummaryInformation``
+    or ``\\x05DocumentSummaryInformation``) is malformed.
+
+    This is the distinguishable error used by the property parsers when a
+    declared count or length cannot fit in the remaining data: a document that
+    declares more string bytes, vector elements or property values than the
+    stream actually contains is rejected *before* anything is allocated or
+    traversed.
+
+    It derives from both :class:`OleFileError` (for callers already catching
+    olefile errors) and :class:`ValueError` (because the cause is a value
+    inconsistent with the data), so both existing styles of error handling
+    keep working.
     """
     pass
 
@@ -2173,13 +2236,51 @@ class OleFileIO:
         try:
             # header
             s = fp.read(28)
+            if len(s) != 28:
+                raise PropertySetError(
+                    'property set header is truncated (%d bytes)' % len(s))
             clsid = _clsid(s[8:24])
             # format id
             s = fp.read(20)
+            if len(s) != 20:
+                raise PropertySetError(
+                    'property set format identifier is truncated (%d bytes)'
+                    % len(s))
             fmtid = _clsid(s[:16])
             fp.seek(i32(s, 16))
             # get section
-            s = b"****" + fp.read(i32(fp.read(4))-4)
+            section_size_data = fp.read(4)
+            if len(section_size_data) != 4:
+                raise PropertySetError(
+                    'property section size is truncated (%d bytes)'
+                    % len(section_size_data))
+            section_size = i32(section_size_data)
+            # The section starts with its own size and the property count
+            # (8 bytes). Note that the old expression ``read(size-4)``
+            # underflowed for size < 4: a negative argument to read() means
+            # "read everything", so a truncated header silently turned into the
+            # whole stream. Reject such a size explicitly instead.
+            if section_size < 8:
+                raise PropertySetError(
+                    'property section size %d is too small' % section_size)
+            # Read at most what the stream actually contains; every offset
+            # below is bounded by len(s), so a declared size larger than the
+            # stream can never make a parser look past the available bytes.
+            # Properties that fit in the available data are still parsed.
+            s = b"****" + fp.read(section_size - 4)
+            if len(s) < 8:
+                raise PropertySetError(
+                    'property section is truncated (%d bytes available, at '
+                    'least 8 required)' % len(s))
+            if len(s) != section_size:
+                # The declared size is larger than the data actually present:
+                # keep parsing the available bytes, but report the truncation
+                # instead of silently working on a short section.
+                self._raise_defect(
+                    DEFECT_INCORRECT,
+                    'property section declares %d bytes but only %d are present'
+                    % (section_size, len(s)),
+                    PropertySetError)
             # number of properties:
             num_props = i32(s, 4)
         except BaseException as exc:
@@ -2190,13 +2291,28 @@ class OleFileIO:
                 repr(streampath), exc)
             self._raise_defect(DEFECT_INCORRECT, msg, type(exc))
             return data
-        # clamp num_props based on the data length
-        num_props = min(num_props, int(len(s) / 8))
+        # Clamp num_props based on the data length: the property table needs
+        # 8 bytes per entry, including the 8-byte section header.
+        declared_num_props = num_props
+        num_props = self._bound_property_count(len(s), num_props)
+        if num_props != declared_num_props:
+            # A count that cannot fit is a malformed section, not a reason to
+            # silently truncate the table. Report it as a distinguishable
+            # defect before iterating over the valid prefix.
+            self._raise_defect(
+                DEFECT_INCORRECT,
+                'property count %d exceeds the %d entries that fit in the '
+                'section' % (declared_num_props, num_props),
+                PropertySetError)
         for i in iterrange(num_props):
             property_id = 0 # just in case of an exception
             try:
                 property_id = i32(s, 8+i*8)
                 offset = i32(s, 12+i*8)
+                # A property offset must point to the 4-byte type tag inside
+                # the section. Check it explicitly so a bad offset yields a
+                # distinguishable PropertySetError instead of a struct.error:
+                self._check_available(len(s), offset, 4, 'property type tag')
                 property_type = i32(s, offset)
 
                 vt_name = VT.get(property_type, 'UNKNOWN')
@@ -2206,12 +2322,83 @@ class OleFileIO:
                 data[property_id] = value
             except BaseException as exc:
                 # catch exception while parsing each property, and only raise
-                # a DEFECT_INCORRECT, because parsing can go on
+                # a DEFECT_INCORRECT, because parsing can go on.
+                # The offending property is deliberately left out of the
+                # result: a value that could not be fully validated must not
+                # be published, and must not affect the following properties.
                 msg = 'Error while parsing property id %d in stream %s: %s' % (
                     property_id, repr(streampath), exc)
                 self._raise_defect(DEFECT_INCORRECT, msg, type(exc))
 
         return data
+
+    @staticmethod
+    def _bound_property_count(data_length, num_props):
+        """
+        Return the number of property entries that can actually be described by
+        ``data_length`` bytes of section data.
+
+        The section starts with an 8-byte header (section size, property
+        count) followed by ``num_props`` entries of 8 bytes each. A declared
+        count that does not fit in the available bytes is clamped, so the
+        property table loop can never be asked to iterate over an arbitrary
+        attacker-controlled count. The comparison is done on plain integers
+        (``num_props`` is an unsigned 32-bit value), so no length computation
+        can wrap around.
+
+        :param int data_length: number of bytes available for the section
+        :param int num_props: declared number of properties (unsigned 32 bits)
+        :return: bounded number of property entries
+        :rtype: int
+        """
+        # keep the historical clamp formula for the upper bound, but make sure
+        # it never returns a negative value for very short sections:
+        max_props = max(0, (data_length - 8) // 8)
+        return min(num_props, max_props)
+
+    @staticmethod
+    def _check_available(data_length, offset, needed, what='property value'):
+        """
+        Check that ``needed`` bytes starting at ``offset`` are available in a
+        buffer of ``data_length`` bytes.
+
+        All arguments are plain Python integers, so the addition can never wrap
+        around, whatever the declared counts in the document are. Raises a
+        :class:`PropertySetError` when the declared size does not fit in the
+        remaining data, before any allocation or traversal is attempted.
+
+        :param int data_length: total size of the data buffer
+        :param int offset: offset of the value inside the buffer (>= 0)
+        :param int needed: number of bytes required by the value (>= 0)
+        :param str what: description used in the error message
+        :raises PropertySetError: if the value does not fit in the buffer
+        """
+        if offset < 0 or needed < 0 or offset > data_length or \
+                needed > data_length - offset:
+            raise PropertySetError(
+                '%s declares %d bytes at offset %d, but only %d bytes are '
+                'available' % (what, needed, offset, max(0, data_length - offset)))
+
+    @classmethod
+    def _read_count(cls, s, offset, what):
+        """
+        Read a 32-bit unsigned count/length field at ``offset``, after checking
+        that the field itself is present.
+
+        Using this helper instead of a bare :func:`i32` call keeps the failure
+        mode consistent: a truncated count field raises
+        :class:`PropertySetError` (which is also a :class:`ValueError` and an
+        :class:`OleFileError`), never a raw ``struct.error``.
+
+        :param bytes s: data buffer
+        :param int offset: offset of the 4-byte count field
+        :param str what: description used in the error message
+        :return: the unsigned 32-bit count
+        :rtype: int
+        :raises PropertySetError: if the field is not fully present
+        """
+        cls._check_available(len(s), offset, 4, what)
+        return i32(s, offset)
 
     def _parse_property(self, s, offset, property_id, property_type, convert_time, no_conversion):
         v = None
@@ -2219,30 +2406,105 @@ class OleFileIO:
             v, _ = self._parse_property_basic(s, offset, property_id, property_type, convert_time, no_conversion)
         elif property_type == VT_VECTOR | VT_VARIANT:
             log.debug('property_type == VT_VECTOR | VT_VARIANT')
-            off = 4
-            count = i32(s, offset)
+            # A variant vector is a 4-byte count followed by ``count`` elements,
+            # each made of a 4-byte Variant type tag and its value. Bound the
+            # count by the number of tags that can possibly fit in the
+            # remaining bytes *before* creating the list or entering the loop,
+            # so a single 4-byte count can never force billions of iterations
+            # from a tiny section.
+            count = self._read_count(s, offset, 'variant vector element count')
+            self._check_available(len(s), offset + 4, count * 4,
+                                  'variant vector element count')
             values = []
-            for _ in range(count):
-                property_type = i32(s, offset + off)
-                v, sz  = self._parse_property_basic(s, offset + off + 4, property_id, property_type, convert_time, no_conversion)
+            off = 4
+            for _ in iterrange(count):
+                # every element has its own type tag
+                self._check_available(len(s), offset + off, 4,
+                                      'variant vector element type')
+                element_type = i32(s, offset + off)
+                v, sz = self._parse_property_basic(
+                    s, offset + off + 4, property_id, element_type,
+                    convert_time, no_conversion)
+                # ``sz`` is the value width. The 4-byte tag guarantees forward
+                # progress even for zero-width values (VT_EMPTY/VT_NULL), so
+                # the loop always advances; ``_parse_property_basic`` already
+                # checked that the value itself fits in the buffer.
                 values.append(v)
-                off += sz + 4
+                off += 4 + sz
             v = values
 
         elif property_type & VT_VECTOR:
             property_type_base = property_type & ~VT_VECTOR
             log.debug('property_type == VT_VECTOR | %s' % VT.get(property_type_base, 'UNKNOWN'))
-            off = 4
-            count = i32(s, offset)
+            count = self._read_count(s, offset, 'vector element count')
             values = []
-            for _ in range(count):
+            # Establish the count/width/remaining-bytes relationship once,
+            # before any allocation or traversal. The width comes from the
+            # element type: exact for fixed-width scalars, a minimum (the
+            # length field) for length-prefixed values. An unknown element type
+            # has no defined width and is rejected, because its element count
+            # cannot be validated.
+            element_width = self._vector_element_width(property_type_base)
+            if count:
+                if element_width is None:
+                    raise PropertySetError(
+                        'unsupported vector element type %d, cannot validate '
+                        'element count' % property_type_base)
+                if element_width <= 0:
+                    raise PropertySetError(
+                        'vector of zero-width element type %d declares %d '
+                        'elements' % (property_type_base, count))
+                self._check_available(len(s), offset + 4,
+                                      count * element_width,
+                                      'vector element count')
+            off = 4
+            for _ in iterrange(count):
                 v, sz = self._parse_property_basic(s, offset + off, property_id, property_type & ~VT_VECTOR, convert_time, no_conversion)
+                # Each element must consume at least one byte: otherwise the
+                # loop would repeat the same position ``count`` times, building
+                # a list without ever consuming data (the original amplification
+                # vector for unsupported base types).
+                if sz <= 0:
+                    raise PropertySetError(
+                        'invalid size %d for vector element (type %d)'
+                        % (sz, property_type_base))
+                # validate the element against the bytes left in the section
+                self._check_available(len(s), offset + off, sz,
+                                      'vector element')
                 values.append(v)
                 off += sz
             v = values
         else:
             log.debug('property id=%d: type=%d not implemented in parser yet' % (property_id, property_type))
         return v
+
+    @staticmethod
+    def _vector_element_width(property_type_base):
+        """
+        Return the width in bytes of a single element of a ``VT_VECTOR``, for
+        the given base property type.
+
+        For fixed-width scalar types this is the exact size of the value. For
+        length-prefixed types (strings, BLOB, ClipboardData) it is the minimum
+        size, i.e. the width of the length/count field; the payload it declares
+        is validated separately when the element is parsed.
+
+        A return value of 0 means the type has no value bytes at all
+        (``VT_EMPTY``/``VT_NULL``), so a non-empty vector of it can never make
+        progress. ``None`` means the type is unknown and no width can be
+        established.
+
+        :param int property_type_base: property type without the VT_VECTOR bit
+        :return: width in bytes, 0 for zero-width types, or None if unknown
+        :rtype: int or None
+        """
+        # zero-width values: a vector of them is only valid when empty
+        if property_type_base in (VT_EMPTY, VT_NULL):
+            return 0
+        width = VT_FIXED_VALUE_SIZE.get(property_type_base)
+        if width is not None:
+            return width
+        return VT_MIN_VALUE_SIZE.get(property_type_base)
 
     def _parse_property_basic(self, s, offset, property_id, property_type, convert_time, no_conversion):
             value = None
@@ -2251,20 +2513,24 @@ class OleFileIO:
             # a dictionary instead?)
 
             if property_type == VT_I2: # 16-bit signed integer
+                self._check_available(len(s), offset, 2)
                 value = i16(s, offset)
                 if value >= 32768:
                     value = value - 65536
                 size = 2
             elif property_type == VT_UI2: # 2-byte unsigned integer
+                self._check_available(len(s), offset, 2)
                 value = i16(s, offset)
                 size = 2
             elif property_type in (VT_I4, VT_INT, VT_ERROR):
                 # VT_I4: 32-bit signed integer
                 # VT_ERROR: HRESULT, similar to 32-bit signed integer,
                 # see https://msdn.microsoft.com/en-us/library/cc230330.aspx
+                self._check_available(len(s), offset, 4)
                 value = i32(s, offset)
                 size = 4
             elif property_type in (VT_UI4, VT_UINT): # 4-byte unsigned integer
+                self._check_available(len(s), offset, 4)
                 value = i32(s, offset) # FIXME
                 size = 4
             elif property_type in (VT_BSTR, VT_LPSTR):
@@ -2272,7 +2538,12 @@ class OleFileIO:
                 # size is a 32 bits integer, including the null terminator, and
                 # possibly trailing or embedded null chars
                 #TODO: if codepage is unicode, the string should be converted as such
-                count = i32(s, offset)
+                # The declared count is validated against the remaining bytes
+                # before slicing, so a huge count cannot request a huge slice
+                # (Python would silently truncate it and hide the corruption).
+                count = self._read_count(s, offset, 'string byte count')
+                self._check_available(len(s), offset + 4, count,
+                                      'string byte count')
                 value = s[offset+4:offset+4+count-1]
                 # remove all null chars:
                 value = value.replace(b'\x00', b'')
@@ -2280,7 +2551,9 @@ class OleFileIO:
             elif property_type == VT_BLOB:
                 # binary large object (BLOB)
                 # see https://msdn.microsoft.com/en-us/library/dd942282.aspx
-                count = i32(s, offset)
+                count = self._read_count(s, offset, 'BLOB byte count')
+                self._check_available(len(s), offset + 4, count,
+                                      'BLOB byte count')
                 value = s[offset+4:offset+4+count]
                 size = 4 + count
             elif property_type == VT_LPWSTR:
@@ -2288,10 +2561,20 @@ class OleFileIO:
                 # see https://msdn.microsoft.com/en-us/library/dd942313.aspx
                 # "the string should NOT contain embedded or additional trailing
                 # null characters."
-                count = i32(s, offset+4)
+                # ``offset`` points just past the type tag, so the Length field
+                # is the first 4 bytes of the value and the UTF-16 characters
+                # follow it. Length counts characters including the terminating
+                # null. ``count * 2`` is computed with Python integers, so it
+                # cannot wrap around, and the declared character count is
+                # checked against the remaining bytes before slicing.
+                count = self._read_count(
+                    s, offset, 'UnicodeString character count')
+                self._check_available(len(s), offset + 4, count * 2,
+                                      'UnicodeString character count')
                 value = self._decode_utf16_str(s[offset+4:offset+4+count*2])
                 size = 4 + count * 2
             elif property_type == VT_FILETIME:
+                self._check_available(len(s), offset, 8)
                 value = long(i32(s, offset)) + (long(i32(s, offset+4))<<32)
                 # FILETIME is a 64-bit int: "number of 100ns periods
                 # since Jan 1,1601".
@@ -2309,28 +2592,42 @@ class OleFileIO:
                     value = value // 10000000 # seconds
                 size = 8
             elif property_type == VT_UI1: # 1-byte unsigned integer
+                self._check_available(len(s), offset, 1)
                 value = i8(s[offset])
                 size = 1
             elif property_type == VT_CLSID:
+                self._check_available(len(s), offset, 16)
                 value = _clsid(s[offset:offset+16])
                 size = 16
             elif property_type == VT_CF:
                 # PropertyIdentifier or ClipboardData??
                 # see https://msdn.microsoft.com/en-us/library/dd941945.aspx
-                count = i32(s, offset)
+                count = self._read_count(
+                    s, offset, 'ClipboardData byte count')
+                self._check_available(len(s), offset + 4, count,
+                                      'ClipboardData byte count')
                 value = s[offset+4:offset+4+count]
                 size = 4 + count
             elif property_type == VT_BOOL:
                 # VARIANT_BOOL, 16 bits bool, 0x0000=Fals, 0xFFFF=True
                 # see https://msdn.microsoft.com/en-us/library/cc237864.aspx
+                self._check_available(len(s), offset, 2)
                 value = bool(i16(s, offset))
                 size = 2
             else:
                 value = None # everything else yields "None"
+                # Types that are not decoded still have a known width: report
+                # it so that a VT_VECTOR of that type keeps its element offset
+                # in sync, and make sure the bytes are actually present. This
+                # also keeps the vector loop making forward progress.
+                size = VT_FIXED_VALUE_SIZE.get(property_type, 0)
+                if size:
+                    self._check_available(len(s), offset, size,
+                                          'property value')
                 log.debug('property id=%d: type=%d not implemented in parser yet' % (property_id, property_type))
 
-                # missing: VT_EMPTY, VT_NULL, VT_R4, VT_R8, VT_CY, VT_DATE,
-                # VT_DECIMAL, VT_I1, VT_I8, VT_UI8,
+                # missing: VT_R4, VT_R8, VT_CY, VT_DATE, VT_DECIMAL, VT_I1,
+                # VT_I8, VT_UI8,
                 # see https://msdn.microsoft.com/en-us/library/dd942033.aspx
 
                 #print("%08x" % property_id, repr(value), end=" ")
@@ -2380,44 +2677,78 @@ class OleFileIO:
 
         data = []
 
-        # header
-        s = fp.read(28)
-        clsid = _clsid(s[8:24])
-
-        # PropertySetStream.cSections (4 bytes starts at 1c): number of property sets in this stream
-        sections_count = i32(s, 24)
-
-        section_file_pointers = []
-
         try:
-            for i in range(sections_count):
+            # header
+            s = fp.read(28)
+            if len(s) != 28:
+                raise PropertySetError(
+                    'property set header is truncated (%d bytes)' % len(s))
+            clsid = _clsid(s[8:24])
+
+            # PropertySetStream.cSections (4 bytes starts at 1c): number of property sets in this stream
+            sections_count = i32(s, 24)
+
+            for i in iterrange(sections_count):
                 # format id
                 s = fp.read(20)
+                if len(s) != 20:
+                    raise PropertySetError(
+                        'property set section header is truncated (%d bytes)'
+                        % len(s))
                 fmtid = _clsid(s[:16])
 
                 if fmtid == FMTID_USERDEFINED_PROPERTIES:
                     file_pointer = i32(s, 16)
                     fp.seek(file_pointer)
                     # read saved sections
-                    s = b"****" + fp.read(i32(fp.read(4)) - 4)
+                    section_size_data = fp.read(4)
+                    if len(section_size_data) != 4:
+                        raise PropertySetError(
+                            'property section size is truncated (%d bytes)'
+                            % len(section_size_data))
+                    section_size = i32(section_size_data)
+                    if section_size < 8:
+                        raise PropertySetError(
+                            'property section size %d is too small'
+                            % section_size)
+                    # As in getproperties(), read only what the stream contains
+                    # so that every offset below is bounded by len(s).
+                    s = b"****" + fp.read(section_size - 4)
                     # number of properties:
                     num_props = i32(s, 4)
-
-                    PropertyIdentifierAndOffset = s[8: 8+8*num_props]
+                    # Bound the declared property count by the bytes that are
+                    # actually present: the table needs 8 bytes per entry after
+                    # the 8-byte section header. This replaces the previous
+                    # slice (which silently produced a short table) and stops a
+                    # huge count from driving the dictionaries/loops below.
+                    num_props = self._bound_property_count(len(s), num_props)
 
                     # property names (dictionary)
                     # ref: https://docs.microsoft.com/en-us/openspecs/windows_protocols/MS-OLEPS/99127b7f-c440-4697-91a4-c853086d6b33
-                    index = 8+8*num_props
-                    entry_count = i32(s[index: index+4])
+                    # The name dictionary follows the property table: a 4-byte
+                    # entry count, then count*(identifier, string length, string).
+                    index = 8 + 8 * num_props
+                    self._check_available(len(s), index, 4,
+                                          'property name dictionary count')
+                    entry_count = i32(s, index)
                     index += 4
-                    for i in range(entry_count):
-                        identifier = s[index: index +4]
+                    # Each entry needs at least 8 bytes (identifier + length).
+                    # Reject a count that cannot fit before looping: without
+                    # this, a 4-byte entry_count could force an arbitrary
+                    # number of iterations, each appending a record and
+                    # re-slicing a now out-of-range index.
+                    self._check_available(len(s), index, entry_count * 8,
+                                          'property name dictionary entry count')
+                    for _ in iterrange(entry_count):
+                        self._check_available(len(s), index, 8,
+                                              'property name dictionary entry')
+                        identifier = s[index: index + 4]
                         str_size = i32(s[index+4: index + 8])
+                        self._check_available(len(s), index + 8, str_size,
+                                              'property name string')
                         string = s[index+8: index+8+str_size].decode('utf_8').strip('\0')
                         data.append({'property_name':string, 'value':None})
                         index = index+8+str_size
-                    # clamp num_props based on the data length
-                    num_props = min(num_props, int(len(s) / 8))
 
                     # property values
                     # ref: https://docs.microsoft.com/en-us/openspecs/windows_protocols/MS-OLEPS/f122b9d7-e5cf-4484-8466-83f6fd94b3cc
@@ -2426,6 +2757,8 @@ class OleFileIO:
                         try:
                             property_id = i32(s, 8 + i * 8)
                             offset = i32(s, 12 + i * 8)
+                            self._check_available(len(s), offset, 4,
+                                                  'property type tag')
                             property_type = i32(s, offset)
 
                             vt_name = VT.get(property_type, 'UNKNOWN')
@@ -2435,45 +2768,69 @@ class OleFileIO:
                             # a dictionary instead?)
 
                             if property_type == VT_I2:  # 16-bit signed integer
+                                self._check_available(len(s), offset + 4, 2)
                                 value = i16(s, offset + 4)
                                 if value >= 32768:
                                     value = value - 65536
                             elif property_type == 1:
                                 # supposed to be VT_NULL but seems it is not NULL
+                                self._check_available(len(s), offset + 8, 4,
+                                                      'property string length')
                                 str_size = i32(s, offset + 8)
-                                value = s[offset + 12:offset + 12 + str_size - 1]
+                                value_len = max(0, str_size - 1)
+                                self._check_available(len(s), offset + 12,
+                                                      value_len,
+                                                      'property string')
+                                value = s[offset + 12:offset + 12 + value_len]
 
                             elif property_type == VT_UI2:  # 2-byte unsigned integer
+                                self._check_available(len(s), offset + 4, 2)
                                 value = i16(s, offset + 4)
                             elif property_type in (VT_I4, VT_INT, VT_ERROR):
                                 # VT_I4: 32-bit signed integer
                                 # VT_ERROR: HRESULT, similar to 32-bit signed integer,
                                 # see https://msdn.microsoft.com/en-us/library/cc230330.aspx
+                                self._check_available(len(s), offset + 4, 4)
                                 value = i32(s, offset + 4)
                             elif property_type in (VT_UI4, VT_UINT):  # 4-byte unsigned integer
+                                self._check_available(len(s), offset + 4, 4)
                                 value = i32(s, offset + 4)  # FIXME
                             elif property_type in (VT_BSTR, VT_LPSTR):
                                 # CodePageString, see https://msdn.microsoft.com/en-us/library/dd942354.aspx
                                 # size is a 32 bits integer, including the null terminator, and
                                 # possibly trailing or embedded null chars
                                 # TODO: if codepage is unicode, the string should be converted as such
+                                self._check_available(len(s), offset + 4, 4,
+                                                      'property string length')
                                 count = i32(s, offset + 4)
+                                self._check_available(len(s), offset + 8, count,
+                                                      'property string')
                                 value = s[offset + 8:offset + 8 + count - 1]
                                 # remove all null chars:
                                 value = value.replace(b'\x00', b'')
                             elif property_type == VT_BLOB:
                                 # binary large object (BLOB)
                                 # see https://msdn.microsoft.com/en-us/library/dd942282.aspx
+                                self._check_available(len(s), offset + 4, 4,
+                                                      'BLOB length')
                                 count = i32(s, offset + 4)
+                                self._check_available(len(s), offset + 8, count,
+                                                      'BLOB')
                                 value = s[offset + 8:offset + 8 + count]
                             elif property_type == VT_LPWSTR:
                                 # UnicodeString
                                 # see https://msdn.microsoft.com/en-us/library/dd942313.aspx
                                 # "the string should NOT contain embedded or additional trailing
                                 # null characters."
+                                self._check_available(len(s), offset + 4, 4,
+                                                      'UnicodeString length')
                                 count = i32(s, offset + 4)
+                                self._check_available(len(s), offset + 8,
+                                                      count * 2,
+                                                      'UnicodeString')
                                 value = self._decode_utf16_str(s[offset + 8:offset + 8 + count * 2])
                             elif property_type == VT_FILETIME:
+                                self._check_available(len(s), offset + 4, 8)
                                 value = long(i32(s, offset + 4)) + (long(i32(s, offset + 8)) << 32)
                                 # FILETIME is a 64-bit int: "number of 100ns periods
                                 # since Jan 1,1601".
@@ -2490,17 +2847,24 @@ class OleFileIO:
                                     # number of seconds since Jan 1,1601
                                     value = value // 10000000  # seconds
                             elif property_type == VT_UI1:  # 1-byte unsigned integer
+                                self._check_available(len(s), offset + 4, 1)
                                 value = i8(s[offset + 4])
                             elif property_type == VT_CLSID:
+                                self._check_available(len(s), offset + 4, 16)
                                 value = _clsid(s[offset + 4:offset + 20])
                             elif property_type == VT_CF:
                                 # PropertyIdentifier or ClipboardData??
                                 # see https://msdn.microsoft.com/en-us/library/dd941945.aspx
+                                self._check_available(len(s), offset + 4, 4,
+                                                      'ClipboardData length')
                                 count = i32(s, offset + 4)
+                                self._check_available(len(s), offset + 8, count,
+                                                      'ClipboardData')
                                 value = s[offset + 8:offset + 8 + count]
                             elif property_type == VT_BOOL:
                                 # VARIANT_BOOL, 16 bits bool, 0x0000=Fals, 0xFFFF=True
                                 # see https://msdn.microsoft.com/en-us/library/cc237864.aspx
+                                self._check_available(len(s), offset + 4, 2)
                                 value = bool(i16(s, offset + 4))
                             else:
                                 value = None  # everything else yields "None"
